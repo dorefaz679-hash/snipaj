@@ -5,51 +5,118 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const CONCURRENCY = 20;
+const ROBLOSECURITY = process.env.ROBLOSECURITY || "";
+const PLACE_ID = process.env.PLACE_ID || "8737602449";
+const MAX_PAGES = 20;
+const PAGE_CONCURRENCY = 30;
 
-app.get("/", (req, res) => res.json({ status: "ok" }));
+if (!ROBLOSECURITY) {
+    console.warn("[sniper] WARNING: ROBLOSECURITY not set — requests will be unauthenticated");
+}
+
+// ── Priority Queue ────────────────────────────────────────────────────────────
+
+const queue = [];
+let processing = false;
+
+function enqueue(job) {
+    return new Promise((resolve, reject) => {
+        queue.push({ ...job, resolve, reject });
+        queue.sort((a, b) => a.priority - b.priority);
+        console.log(`[queue] enqueued | priority: ${job.priority} | queue length: ${queue.length}`);
+        processNext();
+    });
+}
+
+async function processNext() {
+    if (processing || queue.length === 0) return;
+    processing = true;
+    const job = queue.shift();
+    console.log(`[queue] processing | username: ${job.username} | priority: ${job.priority} | remaining: ${queue.length}`);
+    try {
+        const result = await runSearch(job.username, job.placeId);
+        job.resolve(result);
+    } catch (err) {
+        console.error("[queue] job error:", err);
+        job.reject(err);
+    } finally {
+        processing = false;
+        processNext();
+    }
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+
+app.get("/", (req, res) => {
+    res.json({ status: "ok", queueLength: queue.length, processing });
+});
+
+app.get("/queue", (req, res) => {
+    res.json({
+        queueLength: queue.length,
+        processing,
+        jobs: queue.map((j, i) => ({ position: i + 1, username: j.username, priority: j.priority })),
+    });
+});
 
 app.post("/sniper", async (req, res) => {
-    const { username, placeId } = req.body;
+    const { username, placeId, priority } = req.body;
+    if (!username) return res.status(400).json({ error: "Missing username" });
 
-    if (!username || !placeId) {
-        return res.status(400).json({ error: "Missing username or placeId" });
-    }
+    const jobPriority = Number(priority) || 2;
+    const jobPlaceId = placeId || PLACE_ID;
+    const queuePos = queue.length + (processing ? 1 : 0);
+    console.log(`[sniper] POST | username: ${username} | priority: ${jobPriority} | queue pos: ${queuePos}`);
 
     try {
-        const { userId, displayName } = await resolveUser(username);
-        if (!userId) {
-            return res.json({ found: false, message: `User "${username}" does not exist` });
-        }
-
-        const [thumbnailUrl, serverResult] = await Promise.all([
-            resolveHeadshot(userId),
-            findPlayer(userId, placeId),
-        ]);
-
-        if (serverResult) {
-            return res.json({
-                found: true,
-                serverId: serverResult.serverId,
-                placeId: String(placeId),
-                userId: String(userId),
-                displayName,
-                thumbnailUrl,
-            });
-        }
-
-        return res.json({ found: false, message: "Player not found in any public server" });
-
+        const result = await enqueue({ username, placeId: jobPlaceId, priority: jobPriority });
+        res.json(result);
     } catch (err) {
-        console.error("[sniper] error:", err);
-        return res.status(500).json({ error: String(err) });
+        res.status(500).json({ error: String(err) });
     }
 });
+
+// ── Core search ───────────────────────────────────────────────────────────────
+
+async function runSearch(username, placeId) {
+    console.log(`[search] start | username: ${username} | placeId: ${placeId}`);
+    const { userId, displayName } = await resolveUser(username);
+    if (!userId) {
+        console.log(`[search] user not found: ${username}`);
+        return { found: false, message: `User "${username}" does not exist` };
+    }
+    console.log(`[search] resolved | userId: ${userId} | displayName: ${displayName}`);
+
+    const [thumbnailUrl, serverId] = await Promise.all([
+        resolveHeadshot(userId),
+        findPlayer(userId, placeId),
+    ]);
+
+    if (serverId) {
+        console.log(`[search] FOUND | serverId: ${serverId}`);
+        return { found: true, serverId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl };
+    }
+    console.log(`[search] not found | username: ${username}`);
+    return { found: false, message: "Player not found in any public server" };
+}
+
+// ── Roblox API helpers ────────────────────────────────────────────────────────
+
+function robloxHeaders(extra = {}) {
+    const headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        ...extra,
+    };
+    if (ROBLOSECURITY) headers["Cookie"] = `.ROBLOSECURITY=${ROBLOSECURITY}`;
+    return headers;
+}
 
 async function resolveUser(username) {
     const res = await fetch("https://users.roblox.com/v1/usernames/users", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: robloxHeaders(),
         body: JSON.stringify({ usernames: [username], excludeBannedUsers: false }),
     });
     if (!res.ok) throw new Error(`Users API ${res.status}`);
@@ -62,63 +129,79 @@ async function resolveUser(username) {
 async function resolveHeadshot(userId) {
     try {
         const res = await fetch(
-            `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=150x150&format=Png&isCircular=false`
+            `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=150x150&format=Png&isCircular=false`,
+            { headers: robloxHeaders() }
         );
         if (!res.ok) return "";
         const data = await res.json();
         return data?.data?.[0]?.imageUrl ?? "";
-    } catch {
-        return "";
-    }
+    } catch { return ""; }
 }
 
 async function findPlayer(userId, placeId) {
     let cursor = null;
+    let page = 0;
 
-    while (true) {
+    while (page < MAX_PAGES) {
+        page++;
         const url =
             `https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=Asc&limit=100` +
             (cursor ? `&cursor=${cursor}` : "");
 
-        const res = await fetch(url, {
-            headers: { "Accept": "application/json", "User-Agent": "Mozilla/5.0" },
-        });
+        const res = await fetch(url, { headers: robloxHeaders() });
+
+        if (res.status === 429) {
+            console.warn(`[search] rate limited on page ${page}, waiting 2s`);
+            await sleep(2000);
+            page--;
+            continue;
+        }
         if (!res.ok) {
-            console.error("[sniper] servers API error:", res.status);
+            console.error(`[search] servers API error: ${res.status} on page ${page}`);
             break;
         }
 
         const data = await res.json();
-        const servers = data.data ?? [];
-        console.log(`[sniper] scanning page | servers: ${servers.length} | cursor: ${cursor ?? "start"}`);
+        const servers = (data.data ?? []).filter(s => s.playerTokens?.length);
+        console.log(`[search] page ${page} | servers with players: ${servers.length}`);
 
-        // batch all token-resolve calls across this page concurrently
-        const results = await runConcurrent(
-            servers.filter(s => s.playerTokens?.length),
-            async (server) => {
-                const ids = await resolveTokens(server.playerTokens);
-                if (ids.includes(userId)) return server.id;
-                return null;
-            },
-            CONCURRENCY
-        );
-
-        const found = results.find(r => r !== null);
-        if (found) {
-            console.log("[sniper] FOUND in server:", found);
-            return { serverId: found };
-        }
+        const found = await scanPageConcurrent(servers, userId);
+        if (found) return found;
 
         cursor = data.nextPageCursor ?? null;
-        if (!cursor) break;
+        if (!cursor) {
+            console.log(`[search] exhausted all pages at page ${page}`);
+            break;
+        }
     }
-
     return null;
+}
+
+async function scanPageConcurrent(servers, userId) {
+    return new Promise((resolve) => {
+        let resolved = false;
+        let pending = servers.length;
+        if (pending === 0) return resolve(null);
+
+        for (const server of servers) {
+            resolveTokens(server.playerTokens).then(ids => {
+                if (resolved) return;
+                if (ids.includes(userId)) {
+                    resolved = true;
+                    return resolve(server.id);
+                }
+                pending--;
+                if (pending === 0 && !resolved) resolve(null);
+            }).catch(() => {
+                pending--;
+                if (pending === 0 && !resolved) resolve(null);
+            });
+        }
+    });
 }
 
 async function resolveTokens(tokens) {
     if (!tokens.length) return [];
-
     const body = tokens.map(token => ({
         requestId: `0:${token}:AvatarHeadShot:48x48:png:regular`,
         token,
@@ -127,42 +210,26 @@ async function resolveTokens(tokens) {
         format: "png",
         isCircular: false,
     }));
-
     try {
         const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
             method: "POST",
-            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            headers: robloxHeaders(),
             body: JSON.stringify(body),
         });
         if (!res.ok) return [];
         const data = await res.json();
         return (data.data ?? []).map(e => e.targetId).filter(Boolean);
-    } catch {
-        return [];
-    }
+    } catch { return []; }
 }
 
-// run tasks with limited concurrency
-async function runConcurrent(items, fn, limit) {
-    const results = [];
-    let index = 0;
+// ── Utils ─────────────────────────────────────────────────────────────────────
 
-    async function worker() {
-        while (index < items.length) {
-            const i = index++;
-            results[i] = await fn(items[i]);
-            // short-circuit if already found
-            if (results[i] !== null) {
-                index = items.length;
-            }
-        }
-    }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-    const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
-    await Promise.all(workers);
-    return results;
-}
+// ── Start ─────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
     console.log(`[sniper] listening on port ${PORT}`);
+    console.log(`[sniper] ROBLOSECURITY: ${ROBLOSECURITY ? "SET ✓" : "NOT SET ✗"}`);
+    console.log(`[sniper] PLACE_ID: ${PLACE_ID}`);
 });
