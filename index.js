@@ -8,10 +8,9 @@ const PORT = process.env.PORT || 3000;
 const ROBLOSECURITY = process.env.ROBLOSECURITY || "";
 const PLACE_ID = process.env.PLACE_ID || "8737602449";
 const MAX_PAGES = 20;
-const PAGE_CONCURRENCY = 30;
 
 if (!ROBLOSECURITY) {
-    console.warn("[sniper] WARNING: ROBLOSECURITY not set — requests will be unauthenticated");
+    console.warn("[sniper] WARNING: ROBLOSECURITY not set");
 }
 
 // ── Priority Queue ────────────────────────────────────────────────────────────
@@ -23,7 +22,7 @@ function enqueue(job) {
     return new Promise((resolve, reject) => {
         queue.push({ ...job, resolve, reject });
         queue.sort((a, b) => a.priority - b.priority);
-        console.log(`[queue] enqueued | priority: ${job.priority} | queue length: ${queue.length}`);
+        console.log(`[queue] enqueued | priority: ${job.priority} | length: ${queue.length}`);
         processNext();
     });
 }
@@ -32,12 +31,12 @@ async function processNext() {
     if (processing || queue.length === 0) return;
     processing = true;
     const job = queue.shift();
-    console.log(`[queue] processing | username: ${job.username} | priority: ${job.priority} | remaining: ${queue.length}`);
+    console.log(`[queue] processing | username: ${job.username} | remaining: ${queue.length}`);
     try {
         const result = await runSearch(job.username, job.placeId);
         job.resolve(result);
     } catch (err) {
-        console.error("[queue] job error:", err);
+        console.error("[queue] error:", err);
         job.reject(err);
     } finally {
         processing = false;
@@ -47,16 +46,30 @@ async function processNext() {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-app.get("/", (req, res) => {
-    res.json({ status: "ok", queueLength: queue.length, processing });
-});
+app.get("/", (req, res) => res.json({ status: "ok", queueLength: queue.length, processing }));
 
-app.get("/queue", (req, res) => {
-    res.json({
-        queueLength: queue.length,
-        processing,
-        jobs: queue.map((j, i) => ({ position: i + 1, username: j.username, priority: j.priority })),
-    });
+app.get("/queue", (req, res) => res.json({
+    queueLength: queue.length,
+    processing,
+    jobs: queue.map((j, i) => ({ position: i + 1, username: j.username, priority: j.priority })),
+}));
+
+// Fast user resolve + thumbnail — called immediately on button press
+app.post("/resolve", async (req, res) => {
+    const { username } = req.body;
+    if (!username) return res.status(400).json({ ok: false, message: "Missing username" });
+
+    try {
+        const { userId, displayName } = await resolveUser(username);
+        if (!userId) return res.json({ ok: false, message: `User "${username}" does not exist` });
+
+        const thumbnailUrl = await resolveHeadshot(userId);
+        console.log(`[resolve] ${username} -> userId: ${userId} | thumb: ${thumbnailUrl ? "ok" : "none"}`);
+        res.json({ ok: true, userId: String(userId), displayName, thumbnailUrl });
+    } catch (err) {
+        console.error("[resolve] error:", err);
+        res.status(500).json({ ok: false, message: String(err) });
+    }
 });
 
 app.post("/sniper", async (req, res) => {
@@ -65,8 +78,7 @@ app.post("/sniper", async (req, res) => {
 
     const jobPriority = Number(priority) || 2;
     const jobPlaceId = placeId || PLACE_ID;
-    const queuePos = queue.length + (processing ? 1 : 0);
-    console.log(`[sniper] POST | username: ${username} | priority: ${jobPriority} | queue pos: ${queuePos}`);
+    console.log(`[sniper] POST | username: ${username} | priority: ${jobPriority} | queue: ${queue.length}`);
 
     try {
         const result = await enqueue({ username, placeId: jobPlaceId, priority: jobPriority });
@@ -79,13 +91,10 @@ app.post("/sniper", async (req, res) => {
 // ── Core search ───────────────────────────────────────────────────────────────
 
 async function runSearch(username, placeId) {
-    console.log(`[search] start | username: ${username} | placeId: ${placeId}`);
+    console.log(`[search] start | username: ${username}`);
     const { userId, displayName } = await resolveUser(username);
-    if (!userId) {
-        console.log(`[search] user not found: ${username}`);
-        return { found: false, message: `User "${username}" does not exist` };
-    }
-    console.log(`[search] resolved | userId: ${userId} | displayName: ${displayName}`);
+    if (!userId) return { found: false, message: `User "${username}" does not exist` };
+    console.log(`[search] userId: ${userId} | displayName: ${displayName}`);
 
     const [thumbnailUrl, serverId] = await Promise.all([
         resolveHeadshot(userId),
@@ -102,15 +111,14 @@ async function runSearch(username, placeId) {
 
 // ── Roblox API helpers ────────────────────────────────────────────────────────
 
-function robloxHeaders(extra = {}) {
-    const headers = {
+function robloxHeaders() {
+    const h = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        ...extra,
     };
-    if (ROBLOSECURITY) headers["Cookie"] = `.ROBLOSECURITY=${ROBLOSECURITY}`;
-    return headers;
+    if (ROBLOSECURITY) h["Cookie"] = `.ROBLOSECURITY=${ROBLOSECURITY}`;
+    return h;
 }
 
 async function resolveUser(username) {
@@ -144,44 +152,40 @@ async function findPlayer(userId, placeId) {
 
     while (page < MAX_PAGES) {
         page++;
-        const url =
-            `https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=Asc&limit=100` +
+        const url = `https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=Asc&limit=100` +
             (cursor ? `&cursor=${cursor}` : "");
 
         const res = await fetch(url, { headers: robloxHeaders() });
 
         if (res.status === 429) {
-            console.warn(`[search] rate limited on page ${page}, waiting 2s`);
+            console.warn(`[search] rate limited page ${page}, waiting 2s`);
             await sleep(2000);
             page--;
             continue;
         }
         if (!res.ok) {
-            console.error(`[search] servers API error: ${res.status} on page ${page}`);
+            console.error(`[search] servers API ${res.status} on page ${page}`);
             break;
         }
 
         const data = await res.json();
         const servers = (data.data ?? []).filter(s => s.playerTokens?.length);
-        console.log(`[search] page ${page} | servers with players: ${servers.length}`);
+        console.log(`[search] page ${page} | servers: ${servers.length}`);
 
-        const found = await scanPageConcurrent(servers, userId);
+        const found = await scanPage(servers, userId);
         if (found) return found;
 
         cursor = data.nextPageCursor ?? null;
-        if (!cursor) {
-            console.log(`[search] exhausted all pages at page ${page}`);
-            break;
-        }
+        if (!cursor) break;
     }
     return null;
 }
 
-async function scanPageConcurrent(servers, userId) {
+async function scanPage(servers, userId) {
     return new Promise((resolve) => {
+        if (!servers.length) return resolve(null);
         let resolved = false;
         let pending = servers.length;
-        if (pending === 0) return resolve(null);
 
         for (const server of servers) {
             resolveTokens(server.playerTokens).then(ids => {
@@ -190,11 +194,9 @@ async function scanPageConcurrent(servers, userId) {
                     resolved = true;
                     return resolve(server.id);
                 }
-                pending--;
-                if (pending === 0 && !resolved) resolve(null);
+                if (--pending === 0) resolve(null);
             }).catch(() => {
-                pending--;
-                if (pending === 0 && !resolved) resolve(null);
+                if (--pending === 0 && !resolved) resolve(null);
             });
         }
     });
@@ -204,11 +206,7 @@ async function resolveTokens(tokens) {
     if (!tokens.length) return [];
     const body = tokens.map(token => ({
         requestId: `0:${token}:AvatarHeadShot:48x48:png:regular`,
-        token,
-        type: "AvatarHeadShot",
-        size: "48x48",
-        format: "png",
-        isCircular: false,
+        token, type: "AvatarHeadShot", size: "48x48", format: "png", isCircular: false,
     }));
     try {
         const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
@@ -222,14 +220,8 @@ async function resolveTokens(tokens) {
     } catch { return []; }
 }
 
-// ── Utils ─────────────────────────────────────────────────────────────────────
-
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-
 app.listen(PORT, () => {
-    console.log(`[sniper] listening on port ${PORT}`);
-    console.log(`[sniper] ROBLOSECURITY: ${ROBLOSECURITY ? "SET ✓" : "NOT SET ✗"}`);
-    console.log(`[sniper] PLACE_ID: ${PLACE_ID}`);
+    console.log(`[sniper] port ${PORT} | ROBLOSECURITY: ${ROBLOSECURITY ? "SET ✓" : "NOT SET ✗"} | PLACE_ID: ${PLACE_ID}`);
 });
