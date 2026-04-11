@@ -51,7 +51,7 @@ function parseMessage(content) {
   return results;
 }
 
-function startDiscordListener() {
+async function startDiscordListener() {
   if (!DISCORD_TOKEN) return;
 
   const client = new Client({
@@ -62,19 +62,20 @@ function startDiscordListener() {
     ]
   });
 
-  client.once("ready", () => {
+  client.once("ready", async () => {
     console.log(`[discord] ${client.user.tag} | channel ${DISCORD_CHANNEL}`);
-    const ch = client.channels.cache.get(DISCORD_CHANNEL);
-    if (ch) {
-      ch.messages.fetch({ limit: 100 }).then(msgs => {
+    try {
+      const ch = await client.channels.fetch(DISCORD_CHANNEL);
+      if (ch) {
+        const msgs = await ch.messages.fetch({ limit: 100 });
         for (const msg of [...msgs.values()].reverse()) {
           for (const entry of parseMessage(msg.content)) {
             addDonation({ ...entry, id: msg.id + "_" + entry.donor, ts: msg.createdTimestamp });
           }
         }
         console.log(`[discord] preloaded ${donationStore.length} donations`);
-      }).catch(() => {});
-    }
+      }
+    } catch {}
   });
 
   client.on("messageCreate", msg => {
@@ -162,10 +163,19 @@ async function getPresenceStatus(userId, placeId) {
 async function batchMatchServer(server, targetUserId, thumbnailUrls) {
   if (!server.playerTokens?.length) return null;
   const tokens = server.playerTokens.slice(0, 100);
-  const batchRequests = tokens.map(token => ({
-    requestId: `0:${token}:AvatarHeadShot:48x48:png:regular`,
-    token, type: "AvatarHeadShot", size: "48x48", format: "png", isCircular: false
-  }));
+  const tokenMap = new Map();
+  const batchRequests = tokens.map((token, idx) => {
+    const requestId = `req_${idx}_${token}`;
+    tokenMap.set(requestId, token);
+    return {
+      requestId,
+      token,
+      type: "AvatarHeadShot",
+      size: "48x48",
+      format: "png",
+      isCircular: false
+    };
+  });
   try {
     const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
       method: "POST", headers: robloxHeaders(), body: JSON.stringify(batchRequests)
@@ -173,11 +183,15 @@ async function batchMatchServer(server, targetUserId, thumbnailUrls) {
     if (!res.ok) return null;
     const data = await res.json();
     for (const entry of data.data || []) {
-      if (!entry) continue;
-      if (entry.targetId && String(entry.targetId) === targetUserId) return { serverId: server.id, matchType: "userId" };
-      if (entry.imageUrl) {
+      if (!entry || !entry.requestId) continue;
+      const token = tokenMap.get(entry.requestId);
+      if (!token) continue;
+      const imageUrl = entry.imageUrl;
+      if (imageUrl) {
         for (const thumb of thumbnailUrls) {
-          if (thumb && entry.imageUrl === thumb) return { serverId: server.id, matchType: "thumbnail" };
+          if (thumb && imageUrl === thumb) {
+            return { serverId: server.id, matchType: "thumbnail" };
+          }
         }
       }
     }
@@ -219,12 +233,16 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
     let cursor = startCursor;
     let pages = 0, seen = 0;
     while (!found.value && !job.cancelled && pages < maxPages) {
-      const { servers, nextCursor } = await fetchServersPage(placeId, sortOrder, limit, cursor);
-      seen += servers.length; pages++;
-      job.step = `W${workerId} ${sortOrder} L${limit} p${pages} s${seen}`;
-      if (servers.length) { serverQueue.push(...servers); notifyQueue(); }
-      cursor = nextCursor;
-      if (!cursor) break;
+      try {
+        const { servers, nextCursor } = await fetchServersPage(placeId, sortOrder, limit, cursor);
+        seen += servers.length; pages++;
+        job.step = `W${workerId} ${sortOrder} L${limit} p${pages} s${seen}`;
+        if (servers.length) { serverQueue.push(...servers); notifyQueue(); }
+        cursor = nextCursor;
+        if (!cursor) break;
+      } catch {
+        break;
+      }
     }
     fetchersFinished++;
     if (fetchersFinished === totalFetchers) notifyQueue();
@@ -239,9 +257,14 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
         continue;
       }
       const batch = serverQueue.splice(0, batchSize);
-      const results = await Promise.all(batch.map(s => batchMatchServer(s, userId, thumbnailUrls)));
-      const hit = results.find(r => r !== null);
-      if (hit) { found.value = true; found.result = hit; return; }
+      const results = await Promise.allSettled(batch.map(s => batchMatchServer(s, userId, thumbnailUrls)));
+      for (const res of results) {
+        if (res.status === 'fulfilled' && res.value !== null) {
+          found.value = true;
+          found.result = res.value;
+          return;
+        }
+      }
     }
   };
 
@@ -265,7 +288,10 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
   }
   while (workers.length < totalFetchers) workers.push(fetcher(null, "Asc", 100, workerId++));
 
-  await Promise.race([Promise.all(workers), matcher()]);
+  await Promise.race([
+    Promise.allSettled(workers),
+    matcher()
+  ]);
   return found.result;
 }
 
@@ -345,6 +371,10 @@ function startLiveBroadcast() {
 }
 
 app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size }));
+
+app.get("/live-servers", (req, res) => {
+  res.json(Array.from(liveDataCache.values()));
+});
 
 app.get("/donations", (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), MAX_DONATIONS);
