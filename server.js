@@ -12,7 +12,7 @@ const DEFAULT_PLACE_ID = process.env.PLACE_ID || "8737602449";
 const MIN_CAPACITY_RATIO = parseFloat(process.env.MIN_CAPACITY_RATIO || "0.0");
 const MAX_WORKERS = parseInt(process.env.MAX_WORKERS || "12");
 const JOB_TTL_MS = 20 * 60 * 1000;
-const DONATION_SECRET = process.env.DONATION_SECRET || "changeme";
+const DONATION_SECRET = process.env.DONATION_SECRET || "phonktobiboy!";
 
 const jobs = new Map();
 const liveSubscribers = new Map();
