@@ -1,19 +1,17 @@
 const express = require("express");
-const http = require("http");
-const { WebSocketServer, WebSocket } = require("ws");
 const fetch = require("node-fetch");
+const { randomUUID } = require("crypto");
 
 const app = express();
 app.use(express.json());
-
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
 
 const PORT = process.env.PORT || 3000;
 const ROBLOSECURITY = process.env.ROBLOSECURITY || "";
 const DEFAULT_PLACE_ID = process.env.PLACE_ID || "8737602449";
 
 if (!ROBLOSECURITY) console.warn("[sniper] WARNING: ROBLOSECURITY not set");
+
+const jobs = new Map();
 
 function robloxHeaders() {
     const h = {
@@ -27,13 +25,7 @@ function robloxHeaders() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function send(ws, obj) {
-    if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(obj));
-    }
-}
-
-app.get("/", (req, res) => res.json({ status: "ok" }));
+app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size }));
 
 app.post("/resolve", async (req, res) => {
     const { username } = req.body;
@@ -50,78 +42,109 @@ app.post("/resolve", async (req, res) => {
     }
 });
 
-wss.on("connection", (ws, req) => {
-    console.log(`[ws] new connection from ${req.socket.remoteAddress}`);
+app.post("/search", async (req, res) => {
+    const { username, placeId, instanceCount } = req.body;
+    if (!username) return res.status(400).json({ ok: false, message: "Missing username" });
 
-    ws.on("message", async (raw) => {
-        let msg;
-        try { msg = JSON.parse(raw); } catch { return; }
+    const jobId = randomUUID();
+    const instances = Math.min(Math.max(Number(instanceCount) || 1, 1), 5);
 
-        const username = msg.username;
-        const placeId = msg.placeId || DEFAULT_PLACE_ID;
-        const instanceCount = Math.min(Math.max(Number(msg.instanceCount) || 1, 1), 5);
+    jobs.set(jobId, {
+        status: "running",
+        step: "Resolving user...",
+        result: null,
+        startedAt: Date.now(),
+    });
 
-        if (!username) {
-            send(ws, { status: "error", msg: "Missing username" });
-            return;
+    console.log(`[search] START jobId:${jobId} username:${username} instances:${instances}`);
+
+    res.json({ ok: true, jobId });
+
+    runSearch(jobId, username, placeId || DEFAULT_PLACE_ID, instances);
+
+    setTimeout(() => {
+        if (jobs.has(jobId)) {
+            console.log(`[search] cleanup jobId:${jobId}`);
+            jobs.delete(jobId);
         }
+    }, 10 * 60 * 1000);
+});
 
-        console.log(`[ws] search | username:${username} placeId:${placeId} instances:${instanceCount}`);
-        send(ws, { status: "update", msg: `Resolving user ${username}...` });
+app.get("/result/:jobId", (req, res) => {
+    const job = jobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ ok: false, message: "Job not found or expired" });
 
+    res.json({
+        ok: true,
+        status: job.status,
+        step: job.step,
+        result: job.result,
+    });
+});
+
+async function runSearch(jobId, username, placeId, instanceCount) {
+    const job = jobs.get(jobId);
+    if (!job) return;
+
+    try {
+        job.step = `Resolving ${username}...`;
         const { userId, displayName } = await resolveUser(username);
         if (!userId) {
-            send(ws, { status: "done", result: "notfound", msg: `User "${username}" does not exist` });
+            job.status = "done";
+            job.result = { found: false, message: `User "${username}" does not exist` };
             return;
         }
+
+        console.log(`[search] ${jobId} userId:${userId} displayName:"${displayName}"`);
 
         const [thumbnailUrl, thumbnailUrl48] = await Promise.all([
             resolveHeadshot(userId, "150x150"),
             resolveHeadshot(userId, "48x48"),
         ]);
 
-        send(ws, { status: "update", msg: `Found user ${displayName} (${userId}). Building cursor map...` });
-
-        const cursors = await buildCursorMap(ws, placeId, instanceCount);
+        job.step = `Building cursor map for ${instanceCount} instance(s)...`;
+        const cursors = await buildCursorMap(job, placeId, instanceCount);
         if (!cursors) {
-            send(ws, { status: "done", result: "notfound", msg: "Failed to read server list — Roblox API error" });
+            job.status = "done";
+            job.result = { found: false, message: "Failed to read server list — Roblox API error" };
             return;
         }
 
         const activeSlices = cursors.filter(c => c.startCursor !== "EXHAUSTED");
-        send(ws, { status: "update", msg: `Scanning ${activeSlices.length} instance(s) in parallel...` });
+        job.step = `Scanning ${activeSlices.length} instance(s) in parallel...`;
 
-        const result = await searchParallel(ws, userId, thumbnailUrl48, placeId, cursors);
+        const result = await searchParallel(job, userId, thumbnailUrl48, placeId, cursors);
 
         if (result) {
-            send(ws, {
-                status: "done",
-                result: "found",
-                data: {
-                    serverId: result.serverId,
-                    placeId: String(placeId),
-                    userId: String(userId),
-                    displayName,
-                    thumbnailUrl,
-                    foundInInstance: result.instance,
-                    matchType: result.matchType,
-                },
-            });
+            console.log(`[search] ${jobId} FOUND serverId:${result.serverId} matchType:${result.matchType}`);
+            job.status = "done";
+            job.result = {
+                found: true,
+                serverId: result.serverId,
+                placeId: String(placeId),
+                userId: String(userId),
+                displayName,
+                thumbnailUrl,
+                foundInInstance: result.instance,
+                matchType: result.matchType,
+            };
         } else {
-            send(ws, {
-                status: "done",
-                result: "notfound",
-                msg: "Player not found — possibly in a private server or offline",
+            console.log(`[search] ${jobId} NOT FOUND`);
+            job.status = "done";
+            job.result = {
+                found: false,
+                message: "Player not found — possibly in a private server or offline",
                 possiblePrivate: true,
-            });
+            };
         }
-    });
+    } catch (err) {
+        console.error(`[search] ${jobId} error:`, err);
+        job.status = "done";
+        job.result = { found: false, message: "Internal search error: " + err.message };
+    }
+}
 
-    ws.on("close", () => console.log("[ws] connection closed"));
-    ws.on("error", (e) => console.error("[ws] error:", e.message));
-});
-
-async function buildCursorMap(ws, placeId, instanceCount) {
+async function buildCursorMap(job, placeId, instanceCount) {
     const PAGES_PER_INSTANCE = [10, 40, 100, 150, 699];
     const slices = PAGES_PER_INSTANCE.slice(0, instanceCount);
     const splitPoints = [null];
@@ -138,13 +161,13 @@ async function buildCursorMap(ws, placeId, instanceCount) {
 
         let res;
         try { res = await fetch(url, { headers: robloxHeaders() }); }
-        catch (e) { console.error(`[cursor] fetch error page ${p}:`, e.message); return null; }
+        catch (e) { console.error(`[cursor] fetch error:`, e.message); return null; }
 
         if (res.status === 429) {
-            send(ws, { status: "update", msg: `Rate limited — waiting 3s...` });
+            job.step = "Rate limited — waiting 3s...";
             await sleep(3500); p--; continue;
         }
-        if (!res.ok) { console.error(`[cursor] API ${res.status} page ${p}`); return null; }
+        if (!res.ok) { console.error(`[cursor] API ${res.status}`); return null; }
 
         const data = await res.json();
         cursor = data.nextPageCursor ?? null;
@@ -160,7 +183,7 @@ async function buildCursorMap(ws, placeId, instanceCount) {
         }
 
         if (!cursor) {
-            console.log(`[cursor] game exhausted at page ${page}`);
+            console.log(`[cursor] exhausted at page ${page}`);
             while (splitPoints.length < instanceCount) splitPoints.push("EXHAUSTED");
             break;
         }
@@ -183,20 +206,19 @@ async function buildCursorMap(ws, placeId, instanceCount) {
     });
 }
 
-async function searchParallel(ws, userId, thumbnailUrl48, placeId, cursors) {
+async function searchParallel(job, userId, thumbnailUrl48, placeId, cursors) {
     return new Promise((resolve) => {
         let finished = false;
         let doneCount = 0;
 
         for (const slice of cursors) {
             if (slice.startCursor === "EXHAUSTED") {
-                console.log(`[search] ${slice.label} skipped — exhausted`);
                 doneCount++;
                 if (!finished && doneCount === cursors.length) { finished = true; resolve(null); }
                 continue;
             }
 
-            searchSlice(ws, userId, thumbnailUrl48, placeId, slice).then(result => {
+            searchSlice(job, userId, thumbnailUrl48, placeId, slice).then(result => {
                 if (finished) return;
                 if (result) {
                     finished = true;
@@ -214,12 +236,10 @@ async function searchParallel(ws, userId, thumbnailUrl48, placeId, cursors) {
     });
 }
 
-async function searchSlice(ws, userId, thumbnailUrl48, placeId, slice) {
+async function searchSlice(job, userId, thumbnailUrl48, placeId, slice) {
     let cursor = slice.startCursor;
     let pagesScanned = 0;
     let serversScanned = 0;
-
-    console.log(`[search] ${slice.label} starting`);
 
     while (pagesScanned < slice.pageLimit) {
         const url = `https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=Asc&limit=100` +
@@ -230,18 +250,15 @@ async function searchSlice(ws, userId, thumbnailUrl48, placeId, slice) {
         catch (e) { await sleep(1500); continue; }
 
         if (res.status === 429) { await sleep(3500); continue; }
-        if (!res.ok) { console.error(`[search] ${slice.label} API ${res.status}`); return null; }
+        if (!res.ok) return null;
 
         const data = await res.json();
         const servers = (data.data ?? []).filter(s => s.playerTokens?.length > 0);
         serversScanned += (data.data ?? []).length;
 
-        send(ws, {
-            status: "update",
-            msg: `${slice.label} — page ${pagesScanned + 1}, ${serversScanned} servers scanned...`,
-        });
+        job.step = `${slice.label} — page ${pagesScanned + 1}, ${serversScanned} servers checked`;
 
-        console.log(`[search] ${slice.label} page ${pagesScanned + 1} | active servers: ${servers.length}`);
+        console.log(`[search] ${slice.label} page ${pagesScanned + 1} | active:${servers.length} total:${serversScanned}`);
 
         if (servers.length > 0) {
             const found = await scanServers(servers, userId, thumbnailUrl48);
@@ -251,10 +268,7 @@ async function searchSlice(ws, userId, thumbnailUrl48, placeId, slice) {
         cursor = data.nextPageCursor ?? null;
         pagesScanned++;
 
-        if (!cursor) {
-            console.log(`[search] ${slice.label} cursor exhausted`);
-            return null;
-        }
+        if (!cursor) return null;
 
         await sleep(100);
     }
@@ -358,6 +372,6 @@ async function resolveHeadshot(userId, size = "150x150") {
     } catch { return ""; }
 }
 
-server.listen(PORT, () => {
-    console.log(`[sniper] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET ✓" : "NOT SET ✗"} | WS ready`);
+app.listen(PORT, () => {
+    console.log(`[sniper] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET ✓" : "NOT SET ✗"}`);
 });
