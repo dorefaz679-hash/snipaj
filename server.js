@@ -55,8 +55,50 @@ function parseMessage(content) {
   return results;
 }
 
+async function fetchHistoryREST() {
+  let before = null;
+  let total = 0;
+  for (let page = 0; page < 5; page++) {
+    const url = `https://discord.com/api/v9/channels/${DISCORD_CHANNEL}/messages?limit=100` + (before ? `&before=${before}` : "");
+    let res;
+    try {
+      res = await fetch(url, {
+        headers: {
+          "Authorization": `Bot ${DISCORD_TOKEN}`,
+          "User-Agent": "DiscordBot (snipaj, 1.0)"
+        }
+      });
+    } catch (e) {
+      console.error(`[discord] REST history fetch error: ${e.message}`);
+      break;
+    }
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[discord] REST history HTTP ${res.status}: ${body}`);
+      break;
+    }
+    const msgs = await res.json();
+    if (!msgs.length) break;
+    for (const msg of [...msgs].reverse()) {
+      for (const entry of parseMessage(msg.content)) {
+        addDonation({ ...entry, id: msg.id + "_" + entry.donor, ts: new Date(msg.timestamp).getTime() });
+        total++;
+      }
+    }
+    before = msgs[msgs.length - 1].id;
+    if (msgs.length < 100) break;
+  }
+  console.log(`[discord] REST preloaded ${total} donations (store size: ${donationStore.length})`);
+}
+
 async function startDiscordListener() {
-  if (!DISCORD_TOKEN) return;
+  if (!DISCORD_TOKEN) {
+    console.warn("[discord] DISCORD_TOKEN not set — listener disabled");
+    return;
+  }
+  console.log(`[discord] starting listener for channel ${DISCORD_CHANNEL}`);
+
+  await fetchHistoryREST();
 
   const client = new Client({
     intents: [
@@ -66,28 +108,21 @@ async function startDiscordListener() {
     ]
   });
 
-  client.once("ready", async () => {
-    try {
-      const ch = await client.channels.fetch(DISCORD_CHANNEL);
-      if (ch) {
-        const msgs = await ch.messages.fetch({ limit: 100 });
-        for (const msg of [...msgs.values()].reverse()) {
-          for (const entry of parseMessage(msg.content)) {
-            addDonation({ ...entry, id: msg.id + "_" + entry.donor, ts: msg.createdTimestamp });
-          }
-        }
-      }
-    } catch {}
+  client.once("ready", () => {
+    console.log(`[discord] gateway ready as ${client.user.tag}`);
   });
 
   client.on("messageCreate", msg => {
     if (msg.channelId !== DISCORD_CHANNEL) return;
     for (const entry of parseMessage(msg.content)) {
       addDonation({ ...entry, id: msg.id + "_" + entry.donor, ts: msg.createdTimestamp });
+      console.log(`[discord] new donation: ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
     }
   });
 
-  client.login(DISCORD_TOKEN).catch(() => {});
+  client.on("error", err => console.error(`[discord] client error: ${err.message}`));
+
+  client.login(DISCORD_TOKEN).catch(err => console.error(`[discord] login failed: ${err.message}`));
 }
 
 function robloxHeaders() {
