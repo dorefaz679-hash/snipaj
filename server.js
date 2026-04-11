@@ -6,7 +6,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const ROBLOSECURITY = process.env.ROBLOSECURITY || "";
 const DEFAULT_PLACE_ID = process.env.PLACE_ID || "8737602449";
-const MIN_CAPACITY_RATIO = 0.15;
+const MIN_CAPACITY_RATIO = 0.0;
 const jobs = new Map();
 const cursorCache = new Map();
 
@@ -52,7 +52,7 @@ app.post("/search", async (req, res) => {
 	const { username, placeId, instanceCount } = req.body;
 	if (!username) return res.status(400).json({ ok: false, message: "Missing username" });
 	const jobId = randomUUID();
-	const instances = Math.min(Math.max(Number(instanceCount) || 1, 1), 8);
+	const instances = Math.min(Math.max(Number(instanceCount) || 1, 1), 12);
 	jobs.set(jobId, { status: "running", step: "Starting...", result: null, startedAt: Date.now(), cancelled: false, userId: null, placeId: placeId || DEFAULT_PLACE_ID });
 	res.json({ ok: true, jobId });
 	runSearch(jobId, username, placeId || DEFAULT_PLACE_ID, instances);
@@ -153,11 +153,8 @@ async function runSearch(jobId, username, placeId, instanceCount) {
 
 		if (job.cancelled) return;
 
-		job.step = `Building ${instanceCount}-way parallel scan...`;
-		const scanStrategies = await buildAdvancedStrategies(job, placeId, instanceCount);
-		
-		job.step = `Scanning with ${scanStrategies.length} strategies...`;
-		const result = await searchWithStrategies(job, userId, [thumb48, thumb720], placeId, scanStrategies);
+		job.step = `DeepSnipe scanning with ${instanceCount} parallel workers...`;
+		const result = await deepSnipe(job, userId, [thumb48, thumb720], placeId, instanceCount);
 
 		if (job.cancelled) return;
 		job.status = "done";
@@ -176,240 +173,128 @@ async function runSearch(jobId, username, placeId, instanceCount) {
 	}
 }
 
-async function buildAdvancedStrategies(job, placeId, instanceCount) {
-	const strategies = [];
-	
-	const cachedCursors = cursorCache.get(placeId);
-	if (cachedCursors && Date.now() - cachedCursors.timestamp < 60000) {
-		strategies.push(...cachedCursors.cursors.slice(0, instanceCount));
-		if (strategies.length >= instanceCount) return strategies.slice(0, instanceCount);
-	}
-
-	const parallelFetches = [];
-	const sortOrders = ['Asc', 'Desc'];
-	const limits = [100, 50, 25];
-	
-	for (const sortOrder of sortOrders) {
-		for (const limit of limits) {
-			if (parallelFetches.length >= instanceCount * 2) break;
-			parallelFetches.push(fetchServerPage(placeId, null, sortOrder, limit));
-		}
-	}
-	
-	parallelFetches.push(fetchServerPage(placeId, null, 'Asc', 100));
-	parallelFetches.push(fetchServerPage(placeId, null, 'Desc', 100));
-	parallelFetches.push(fetchServerPage(placeId, await getRandomCursor(placeId), 'Asc', 100));
-	parallelFetches.push(fetchServerPage(placeId, await getRandomCursor(placeId), 'Desc', 100));
-
-	const results = await Promise.allSettled(parallelFetches);
-	const validCursors = [];
-	
-	for (const result of results) {
-		if (result.status === 'fulfilled' && result.value) {
-			const { cursor, nextCursor, strategy } = result.value;
-			if (cursor !== null && cursor !== "EXHAUSTED") {
-				validCursors.push({
-					startCursor: cursor,
-					nextCursor: nextCursor,
-					strategy: strategy,
-					label: `${strategy.sortOrder}_L${strategy.limit}_${validCursors.length}`
-				});
-			}
-		}
-	}
-
-	const uniqueStrategies = [];
-	const seenCursors = new Set();
-	
-	for (const cursor of validCursors) {
-		const key = `${cursor.startCursor}_${cursor.strategy.sortOrder}`;
-		if (!seenCursors.has(key) && cursor.startCursor !== "EXHAUSTED") {
-			seenCursors.add(key);
-			uniqueStrategies.push(cursor);
-			if (uniqueStrategies.length >= instanceCount) break;
-		}
-	}
-
-	while (uniqueStrategies.length < instanceCount) {
-		uniqueStrategies.push({
-			startCursor: null,
-			strategy: { sortOrder: uniqueStrategies.length % 2 === 0 ? 'Asc' : 'Desc', limit: 100 },
-			label: `fallback_${uniqueStrategies.length}`
-		});
-	}
-
-	const finalStrategies = uniqueStrategies.slice(0, instanceCount).map((s, i) => ({
-		instance: i + 1,
-		startCursor: s.startCursor,
-		strategy: s.strategy,
-		label: `S${i+1}_${s.strategy.sortOrder}_L${s.strategy.limit}`
-	}));
-
-	cursorCache.set(placeId, {
-		cursors: finalStrategies,
-		timestamp: Date.now()
-	});
-
-	return finalStrategies;
-}
-
-async function fetchServerPage(placeId, cursor, sortOrder, limit) {
-	const url = `https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=${sortOrder}&limit=${limit}` +
-		(cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
-	
-	try {
-		const res = await apiFetch(url);
-		if (!res.ok) return null;
-		const data = await res.json();
-		return {
-			cursor: cursor,
-			nextCursor: data.nextPageCursor || null,
-			strategy: { sortOrder, limit }
-		};
-	} catch {
-		return null;
-	}
-}
-
-async function getRandomCursor(placeId) {
-	try {
-		const res = await apiFetch(`https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=Asc&limit=100`);
-		if (!res.ok) return null;
-		const data = await res.json();
-		return data.nextPageCursor || null;
-	} catch {
-		return null;
-	}
-}
-
-function filterAndSortServers(servers) {
-	return servers
-		.filter(s => {
-			if (!s.playerTokens?.length) return false;
-			if (!s.maxPlayers) return true;
-			return (s.playing / s.maxPlayers) >= MIN_CAPACITY_RATIO;
-		})
-		.sort((a, b) => (b.playing || 0) - (a.playing || 0));
-}
-
-async function searchWithStrategies(job, userId, thumbnailUrls, placeId, strategies) {
-	const found = { value: false };
-	
-	return new Promise((resolve) => {
-		let completed = 0;
-		const totalStrategies = strategies.length;
-		
-		for (const strategy of strategies) {
-			if (strategy.startCursor === "EXHAUSTED") {
-				if (++completed === totalStrategies && !found.value) resolve(null);
-				continue;
-			}
-			
-			scanWithStrategy(job, userId, thumbnailUrls, placeId, strategy, found).then(result => {
-				if (found.value || job.cancelled) return;
-				if (result) { 
-					found.value = true; 
-					resolve({ ...result, instance: strategy.instance }); 
-					return; 
-				}
-				if (++completed === totalStrategies) resolve(null);
-			}).catch(() => {
-				if (++completed === totalStrategies && !found.value) resolve(null);
-			});
-		}
-	});
-}
-
-async function scanWithStrategy(job, userId, thumbnailUrls, placeId, strategy, found) {
-	let cursor = strategy.startCursor;
-	const sortOrder = strategy.strategy.sortOrder;
-	const limit = strategy.strategy.limit;
-	let pagesScanned = 0;
-	let serversScanned = 0;
-	let fetchDone = false;
-	let result = null;
+async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
+	const found = { value: false, result: null };
 	const serverQueue = [];
-	let resolveIdle = null;
-	
-	function notifyQueue() { 
-		if (resolveIdle) { 
-			const r = resolveIdle; 
-			resolveIdle = null; 
-			r(); 
-		} 
-	}
-	
-	async function fetcher() {
-		let cur = cursor;
-		const maxPages = 25;
-		
-		while (!found.value && !result && !job.cancelled && pagesScanned < maxPages) {
+	let queueResolve = null;
+	let fetchCompleted = 0;
+	const totalFetchers = workerCount * 2;
+	let fetchersDone = 0;
+	const sortOrders = ['Asc', 'Desc'];
+	const limits = [100, 50];
+	const maxPagesPerFetcher = 15;
+	const activeFetchers = new Set();
+
+	const notifyQueue = () => {
+		if (queueResolve) {
+			const r = queueResolve;
+			queueResolve = null;
+			r();
+		}
+	};
+
+	const fetchServers = async (startCursor, sortOrder, limit, instanceId) => {
+		let cursor = startCursor;
+		let pages = 0;
+		let serversSeen = 0;
+		while (!found.value && !job.cancelled && pages < maxPagesPerFetcher) {
 			const url = `https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=${sortOrder}&limit=${limit}` +
-				(cur ? `&cursor=${encodeURIComponent(cur)}` : "");
-			
+				(cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
 			let res;
 			try { res = await apiFetch(url); }
-			catch { await sleep(1000); continue; }
-			if (!res.ok) { 
+			catch { await sleep(800); continue; }
+			if (!res.ok) {
 				if (res.status === 400) break;
-				await sleep(1000); 
-				continue; 
-			}
-			
-			const data = await res.json();
-			const allServers = data.data ?? [];
-			serversScanned += allServers.length;
-			pagesScanned++;
-			
-			job.step = `${strategy.label} — p${pagesScanned} | ${serversScanned} servers | ${sortOrder} L${limit}`;
-			
-			const active = filterAndSortServers(allServers);
-			if (active.length > 0) { 
-				serverQueue.push(...active); 
-				notifyQueue(); 
-			}
-			
-			cur = data.nextPageCursor ?? null;
-			if (!cur) break;
-		}
-		fetchDone = true;
-		notifyQueue();
-	}
-	
-	async function matcher() {
-		const batchSize = 15;
-		
-		while (!found.value && !result && !job.cancelled) {
-			if (serverQueue.length === 0) {
-				if (fetchDone) break;
-				await new Promise(r => { resolveIdle = r; });
+				await sleep(800);
 				continue;
 			}
-			
+			const data = await res.json();
+			const servers = data.data || [];
+			serversSeen += servers.length;
+			pages++;
+			job.step = `W${instanceId} ${sortOrder} L${limit} p${pages} s${serversSeen}`;
+			const active = servers.filter(s => {
+				if (!s.playerTokens?.length) return false;
+				if (!s.maxPlayers) return true;
+				return (s.playing / s.maxPlayers) >= MIN_CAPACITY_RATIO;
+			});
+			if (active.length) {
+				serverQueue.push(...active);
+				notifyQueue();
+			}
+			cursor = data.nextPageCursor;
+			if (!cursor) break;
+		}
+		fetchersDone++;
+		if (fetchersDone === totalFetchers) notifyQueue();
+	};
+
+	const matcher = async () => {
+		const batchSize = 20;
+		while (!found.value && !job.cancelled) {
+			if (serverQueue.length === 0) {
+				if (fetchersDone === totalFetchers) break;
+				await new Promise(r => { queueResolve = r; });
+				continue;
+			}
 			const batch = serverQueue.splice(0, batchSize);
-			const promises = batch.map(s => enhancedBatchMatch(s, userId, thumbnailUrls));
+			const promises = batch.map(s => deepMatchServer(s, userId, thumbnailUrls));
 			const hits = await Promise.all(promises);
-			const hit = hits.find(h => h != null);
-			
-			if (hit) { 
-				result = hit; 
-				return; 
+			const hit = hits.find(h => h !== null);
+			if (hit) {
+				found.value = true;
+				found.result = hit;
+				return;
+			}
+		}
+	};
+
+	const startCursors = await Promise.all([
+		(async () => null)(),
+		(async () => {
+			try {
+				const res = await apiFetch(`https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=Asc&limit=100`);
+				const data = await res.json();
+				return data.nextPageCursor || null;
+			} catch { return null; }
+		})(),
+		(async () => {
+			try {
+				const res = await apiFetch(`https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=Desc&limit=100`);
+				const data = await res.json();
+				return data.nextPageCursor || null;
+			} catch { return null; }
+		})(),
+	]);
+
+	const fetcherPromises = [];
+	let workerId = 1;
+	for (const sortOrder of sortOrders) {
+		for (const limit of limits) {
+			for (let i = 0; i < Math.max(1, Math.floor(workerCount / 2)); i++) {
+				const cursor = startCursors[fetcherPromises.length % startCursors.length];
+				fetcherPromises.push(fetchServers(cursor, sortOrder, limit, workerId++));
+				if (fetcherPromises.length >= totalFetchers) break;
 			}
 		}
 	}
-	
-	await Promise.all([fetcher(), matcher()]);
-	return result ?? null;
+	while (fetcherPromises.length < totalFetchers) {
+		fetcherPromises.push(fetchServers(null, 'Asc', 100, workerId++));
+	}
+
+	await Promise.race([
+		Promise.all(fetcherPromises),
+		matcher()
+	]);
+
+	return found.result;
 }
 
-async function enhancedBatchMatch(server, userId, thumbnailUrls) {
+async function deepMatchServer(server, userId, thumbnailUrls) {
 	if (!server.playerTokens?.length) return null;
-	
 	const tokens = server.playerTokens.slice(0, 100);
 	const uid = String(userId);
-	
 	const batchRequests = [];
-	
 	for (const token of tokens) {
 		batchRequests.push({
 			requestId: `0:${token}:AvatarHeadShot:48x48:png:regular`,
@@ -420,21 +305,17 @@ async function enhancedBatchMatch(server, userId, thumbnailUrls) {
 			isCircular: false,
 		});
 	}
-	
 	try {
 		const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
 			method: "POST",
 			headers: robloxHeaders(),
 			body: JSON.stringify(batchRequests),
 		});
-		
 		if (!res.ok) {
 			if (res.status === 429) await sleep(2000);
 			return null;
 		}
-		
 		const data = await res.json();
-		
 		for (const entry of (data.data ?? [])) {
 			if (!entry) continue;
 			if (entry.targetId && String(entry.targetId) === uid) {
@@ -448,7 +329,6 @@ async function enhancedBatchMatch(server, userId, thumbnailUrls) {
 				}
 			}
 		}
-		
 		return null;
 	} catch {
 		return null;
