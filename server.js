@@ -78,13 +78,7 @@ app.post("/presence-check", async (req, res) => {
 	if (!ROBLOSECURITY) return res.json({ abort: false });
 	const presence = await getPresenceStatus(job.userId, placeId || DEFAULT_PLACE_ID);
 	if (presence.type === "offline") {
-		return res.json({ abort: true, message: `Player went offline during search`, presenceStatus: "offline" });
-	}
-	if (presence.type === "online") {
-		return res.json({ abort: true, message: `Player left the game (now on website)`, presenceStatus: "online" });
-	}
-	if (presence.inGame && !presence.inThisGame) {
-		return res.json({ abort: true, message: `Player moved to a different game`, presenceStatus: "othergame" });
+		return res.json({ abort: true, message: "Player went offline during search", presenceStatus: "offline" });
 	}
 	return res.json({ abort: false });
 });
@@ -131,34 +125,30 @@ async function runSearch(jobId, username, placeId, instanceCount) {
 			resolveHeadshot(userId, "150x150"),
 			resolveHeadshot(userId, "48x48"),
 		]);
+
 		job.step = "Checking presence...";
 		const presence = await getPresenceStatus(userId, placeId);
+
 		if (presence.type === "offline") {
 			job.status = "done";
 			job.result = { found: false, message: `${displayName} is offline`, presenceStatus: "offline" };
 			return;
 		}
+
 		if (presence.type === "online") {
 			job.status = "done";
 			job.result = { found: false, message: `${displayName} is on the Roblox website but not in any game`, presenceStatus: "online" };
 			return;
 		}
-		if (presence.type !== "unknown" && !presence.inGame) {
-			job.status = "done";
-			job.result = { found: false, message: `${displayName} is not currently in a game`, presenceStatus: presence.type };
-			return;
-		}
-		if (presence.inGame && !presence.inThisGame) {
-			job.status = "done";
-			job.result = { found: false, message: `${displayName} is in a different game, not this one`, presenceStatus: "othergame" };
-			return;
-		}
-		if (presence.inGame && presence.gameId) {
+
+		if (presence.inGame && presence.gameId && presence.inThisGame) {
 			job.status = "done";
 			job.result = { found: true, serverId: presence.gameId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: 1, matchType: "presence" };
 			return;
 		}
+
 		if (job.cancelled) return;
+
 		job.step = `Building ${instanceCount}-instance cursor map...`;
 		const cursors = await buildCursorMap(job, placeId, instanceCount);
 		if (!cursors) {
@@ -166,11 +156,14 @@ async function runSearch(jobId, username, placeId, instanceCount) {
 			job.result = { found: false, message: "Failed to read server list" };
 			return;
 		}
+
 		const live = cursors.filter(c => c.startCursor !== "EXHAUSTED").length;
 		job.step = `Scanning ${live} instance(s) in parallel...`;
 		const result = await searchParallel(job, userId, thumb48, placeId, cursors);
+
 		if (job.cancelled) return;
 		job.status = "done";
+
 		if (result) {
 			job.result = { found: true, serverId: result.serverId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: result.instance, matchType: result.matchType };
 		} else {
@@ -180,7 +173,6 @@ async function runSearch(jobId, username, placeId, instanceCount) {
 		}
 	} catch (err) {
 		if (job.cancelled) return;
-		console.error(`[${jobId}] error:`, err);
 		job.status = "done";
 		job.result = { found: false, message: "Internal error: " + err.message };
 	}
@@ -198,8 +190,8 @@ async function buildCursorMap(job, placeId, instanceCount) {
 		const url = serverListUrl(placeId, pipelineCursor);
 		let res;
 		try { res = await apiFetch(url); }
-		catch (e) { console.error("[cursor] fetch error:", e.message); return null; }
-		if (!res.ok) { console.error("[cursor] API", res.status); return null; }
+		catch (e) { return null; }
+		if (!res.ok) { return null; }
 		const data = await res.json();
 		pipelineCursor = data.nextPageCursor ?? null;
 		page++;
@@ -249,8 +241,7 @@ async function searchParallel(job, userId, thumbnailUrl48, placeId, cursors) {
 				if (found.value || job.cancelled) return;
 				if (result) { found.value = true; resolve({ ...result, instance: slice.instance }); return; }
 				if (++done === cursors.length) resolve(null);
-			}).catch(err => {
-				console.error(`[scan] ${slice.label}:`, err.message);
+			}).catch(() => {
 				if (++done === cursors.length && !found.value) resolve(null);
 			});
 		}
