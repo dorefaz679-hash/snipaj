@@ -12,7 +12,7 @@ const DEFAULT_PLACE_ID = process.env.PLACE_ID || "8737602449";
 const MIN_CAPACITY_RATIO = parseFloat(process.env.MIN_CAPACITY_RATIO || "0.0");
 const MAX_WORKERS = parseInt(process.env.MAX_WORKERS || "12");
 const JOB_TTL_MS = 20 * 60 * 1000;
-const DONATION_SECRET = process.env.DONATION_SECRET || "phonktobiboy!";
+const DONATION_SECRET = process.env.DONATION_SECRET || "changeme";
 
 const jobs = new Map();
 const liveSubscribers = new Map();
@@ -20,11 +20,16 @@ const liveDataCache = new Map();
 let liveBroadcastInterval = null;
 
 const MAX_DONATIONS = 200;
+const DONATION_TTL_MS = 20 * 1000;
 const donationStore = [];
 
 function addDonation(entry) {
   donationStore.unshift(entry);
   if (donationStore.length > MAX_DONATIONS) donationStore.length = MAX_DONATIONS;
+  setTimeout(() => {
+    const idx = donationStore.findIndex(d => d.id === entry.id);
+    if (idx !== -1) donationStore.splice(idx, 1);
+  }, DONATION_TTL_MS);
 }
 
 function robloxHeaders() {
@@ -311,13 +316,17 @@ app.post("/donation", (req, res) => {
 });
 
 app.get("/donations", (req, res) => {
+  const now = Date.now();
+  const active = donationStore.filter(d => (now - d.ts) < DONATION_TTL_MS);
   const limit = Math.min(parseInt(req.query.limit || "50", 10), MAX_DONATIONS);
-  res.json({ ok: true, count: Math.min(limit, donationStore.length), donations: donationStore.slice(0, limit) });
+  res.json({ ok: true, count: Math.min(limit, active.length), donations: active.slice(0, limit) });
 });
 
 app.get("/donations/latest", (req, res) => {
-  if (!donationStore.length) return res.json({ ok: true, donation: null });
-  res.json({ ok: true, donation: donationStore[0] });
+  const now = Date.now();
+  const active = donationStore.filter(d => (now - d.ts) < DONATION_TTL_MS);
+  if (!active.length) return res.json({ ok: true, donation: null });
+  res.json({ ok: true, donation: active[0] });
 });
 
 app.get("/live-servers", (req, res) => {
