@@ -6,7 +6,9 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const ROBLOSECURITY = process.env.ROBLOSECURITY || "";
 const DEFAULT_PLACE_ID = process.env.PLACE_ID || "8737602449";
+const MIN_CAPACITY_RATIO = 0.15;
 const jobs = new Map();
+
 function robloxHeaders() {
 	const h = {
 		"Accept": "application/json",
@@ -27,7 +29,9 @@ async function apiFetch(url, opts = {}, retries = 5) {
 	}
 	throw new Error("Max retries exceeded");
 }
+
 app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size }));
+
 app.post("/resolve", async (req, res) => {
 	const { username } = req.body;
 	if (!username) return res.status(400).json({ ok: false, message: "Missing username" });
@@ -40,22 +44,52 @@ app.post("/resolve", async (req, res) => {
 		res.status(500).json({ ok: false, message: String(err) });
 	}
 });
+
 app.post("/search", async (req, res) => {
 	const { username, placeId, instanceCount } = req.body;
 	if (!username) return res.status(400).json({ ok: false, message: "Missing username" });
 	const jobId = randomUUID();
 	const instances = Math.min(Math.max(Number(instanceCount) || 1, 1), 5);
-	jobs.set(jobId, { status: "running", step: "Starting...", result: null, startedAt: Date.now() });
+	jobs.set(jobId, { status: "running", step: "Starting...", result: null, startedAt: Date.now(), cancelled: false, userId: null, placeId: placeId || DEFAULT_PLACE_ID });
 	res.json({ ok: true, jobId });
 	runSearch(jobId, username, placeId || DEFAULT_PLACE_ID, instances);
 	setTimeout(() => jobs.delete(jobId), 20 * 60 * 1000);
 });
+
 app.get("/result/:jobId", (req, res) => {
 	const job = jobs.get(req.params.jobId);
 	if (!job) return res.status(404).json({ ok: false, message: "Job not found or expired" });
 	res.json({ ok: true, status: job.status, step: job.step, result: job.result });
 });
-async function getPresenceStatus(userId) {
+
+app.post("/cancel/:jobId", (req, res) => {
+	const job = jobs.get(req.params.jobId);
+	if (!job) return res.status(404).json({ ok: false, message: "Job not found" });
+	job.cancelled = true;
+	job.status = "done";
+	job.result = { found: false, message: "Cancelled" };
+	res.json({ ok: true });
+});
+
+app.post("/presence-check", async (req, res) => {
+	const { jobId, placeId } = req.body;
+	const job = jobs.get(jobId);
+	if (!job || !job.userId) return res.json({ abort: false });
+	if (!ROBLOSECURITY) return res.json({ abort: false });
+	const presence = await getPresenceStatus(job.userId, placeId || DEFAULT_PLACE_ID);
+	if (presence.type === "offline") {
+		return res.json({ abort: true, message: `Player went offline during search`, presenceStatus: "offline" });
+	}
+	if (presence.type === "online") {
+		return res.json({ abort: true, message: `Player left the game (now on website)`, presenceStatus: "online" });
+	}
+	if (presence.inGame && !presence.inThisGame) {
+		return res.json({ abort: true, message: `Player moved to a different game`, presenceStatus: "othergame" });
+	}
+	return res.json({ abort: false });
+});
+
+async function getPresenceStatus(userId, placeId) {
 	if (!ROBLOSECURITY) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
 	try {
 		const res = await apiFetch("https://presence.roblox.com/v1/presence/users", {
@@ -68,7 +102,7 @@ async function getPresenceStatus(userId) {
 		if (!p) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
 		const presenceType = p.userPresenceType;
 		const inGame = presenceType === 2;
-		const inThisGame = inGame && String(p.rootPlaceId || p.placeId || "") === String(DEFAULT_PLACE_ID);
+		const inThisGame = inGame && String(p.rootPlaceId || p.placeId || "") === String(placeId || DEFAULT_PLACE_ID);
 		return {
 			type: presenceType === 0 ? "offline" : presenceType === 1 ? "online" : presenceType === 2 ? "ingame" : "unknown",
 			inGame,
@@ -80,6 +114,7 @@ async function getPresenceStatus(userId) {
 		return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
 	}
 }
+
 async function runSearch(jobId, username, placeId, instanceCount) {
 	const job = jobs.get(jobId);
 	if (!job) return;
@@ -91,12 +126,13 @@ async function runSearch(jobId, username, placeId, instanceCount) {
 			job.result = { found: false, message: `User "${username}" does not exist` };
 			return;
 		}
+		job.userId = userId;
 		const [thumb150, thumb48] = await Promise.all([
 			resolveHeadshot(userId, "150x150"),
 			resolveHeadshot(userId, "48x48"),
 		]);
 		job.step = "Checking presence...";
-		const presence = await getPresenceStatus(userId);
+		const presence = await getPresenceStatus(userId, placeId);
 		if (presence.type === "offline") {
 			job.status = "done";
 			job.result = { found: false, message: `${displayName} is offline`, presenceStatus: "offline" };
@@ -107,9 +143,7 @@ async function runSearch(jobId, username, placeId, instanceCount) {
 			job.result = { found: false, message: `${displayName} is on the Roblox website but not in any game`, presenceStatus: "online" };
 			return;
 		}
-		if (presence.type === "unknown" && !ROBLOSECURITY) {
-			job.step = "No ROBLOSECURITY — skipping presence gate, scanning servers...";
-		} else if (!presence.inGame) {
+		if (presence.type !== "unknown" && !presence.inGame) {
 			job.status = "done";
 			job.result = { found: false, message: `${displayName} is not currently in a game`, presenceStatus: presence.type };
 			return;
@@ -124,6 +158,7 @@ async function runSearch(jobId, username, placeId, instanceCount) {
 			job.result = { found: true, serverId: presence.gameId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: 1, matchType: "presence" };
 			return;
 		}
+		if (job.cancelled) return;
 		job.step = `Building ${instanceCount}-instance cursor map...`;
 		const cursors = await buildCursorMap(job, placeId, instanceCount);
 		if (!cursors) {
@@ -134,18 +169,23 @@ async function runSearch(jobId, username, placeId, instanceCount) {
 		const live = cursors.filter(c => c.startCursor !== "EXHAUSTED").length;
 		job.step = `Scanning ${live} instance(s) in parallel...`;
 		const result = await searchParallel(job, userId, thumb48, placeId, cursors);
+		if (job.cancelled) return;
 		job.status = "done";
 		if (result) {
 			job.result = { found: true, serverId: result.serverId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: result.instance, matchType: result.matchType };
 		} else {
-			job.result = { found: false, message: "Player not found in any public server", possiblePrivate: true };
+			const finalPresence = await getPresenceStatus(userId, placeId);
+			const definitelyPrivate = finalPresence.inGame && finalPresence.inThisGame;
+			job.result = { found: false, message: definitelyPrivate ? "Player is in a private server" : "Player not found in any public server", possiblePrivate: true };
 		}
 	} catch (err) {
+		if (job.cancelled) return;
 		console.error(`[${jobId}] error:`, err);
 		job.status = "done";
 		job.result = { found: false, message: "Internal error: " + err.message };
 	}
 }
+
 async function buildCursorMap(job, placeId, instanceCount) {
 	const CHUNK = [10, 40, 100, 150, 200];
 	const slices = CHUNK.slice(0, instanceCount);
@@ -154,6 +194,7 @@ async function buildCursorMap(job, placeId, instanceCount) {
 	let page = 0;
 	const totalNeeded = slices.slice(0, -1).reduce((a, b) => a + b, 0);
 	for (let p = 0; p < totalNeeded; p++) {
+		if (job.cancelled) return null;
 		const url = serverListUrl(placeId, pipelineCursor);
 		let res;
 		try { res = await apiFetch(url); }
@@ -179,10 +220,22 @@ async function buildCursorMap(job, placeId, instanceCount) {
 		return { instance: i + 1, startCursor, label: `I${i + 1}[from p${start}]` };
 	});
 }
+
 function serverListUrl(placeId, cursor) {
 	return `https://games.roblox.com/v1/games/${placeId}/servers/Public?sortOrder=Asc&limit=100` +
 		(cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
 }
+
+function filterAndSortServers(servers) {
+	return servers
+		.filter(s => {
+			if (!s.playerTokens?.length) return false;
+			if (!s.maxPlayers) return true;
+			return (s.playing / s.maxPlayers) >= MIN_CAPACITY_RATIO;
+		})
+		.sort((a, b) => (b.playing || 0) - (a.playing || 0));
+}
+
 async function searchParallel(job, userId, thumbnailUrl48, placeId, cursors) {
 	const found = { value: false };
 	return new Promise((resolve) => {
@@ -193,7 +246,7 @@ async function searchParallel(job, userId, thumbnailUrl48, placeId, cursors) {
 				continue;
 			}
 			scanSlicePipelined(job, userId, thumbnailUrl48, placeId, slice, found).then(result => {
-				if (found.value) return;
+				if (found.value || job.cancelled) return;
 				if (result) { found.value = true; resolve({ ...result, instance: slice.instance }); return; }
 				if (++done === cursors.length) resolve(null);
 			}).catch(err => {
@@ -203,6 +256,7 @@ async function searchParallel(job, userId, thumbnailUrl48, placeId, cursors) {
 		}
 	});
 }
+
 async function scanSlicePipelined(job, userId, thumbnailUrl48, placeId, slice, found) {
 	let cursor = slice.startCursor;
 	let pagesScanned = 0;
@@ -214,7 +268,7 @@ async function scanSlicePipelined(job, userId, thumbnailUrl48, placeId, slice, f
 	function notifyQueue() { if (resolveIdle) { const r = resolveIdle; resolveIdle = null; r(); } }
 	async function fetcher() {
 		let cur = cursor;
-		while (!found.value && !result) {
+		while (!found.value && !result && !job.cancelled) {
 			let res;
 			try { res = await apiFetch(serverListUrl(placeId, cur)); }
 			catch { await sleep(1000); continue; }
@@ -224,7 +278,7 @@ async function scanSlicePipelined(job, userId, thumbnailUrl48, placeId, slice, f
 			serversScanned += allServers.length;
 			pagesScanned++;
 			job.step = `${slice.label} — p${pagesScanned} | ${serversScanned} servers`;
-			const active = allServers.filter(s => s.playerTokens?.length > 0);
+			const active = filterAndSortServers(allServers);
 			if (active.length > 0) { serverQueue.push(...active); notifyQueue(); }
 			cur = data.nextPageCursor ?? null;
 			if (!cur) break;
@@ -233,7 +287,7 @@ async function scanSlicePipelined(job, userId, thumbnailUrl48, placeId, slice, f
 		notifyQueue();
 	}
 	async function matcher() {
-		while (!found.value && !result) {
+		while (!found.value && !result && !job.cancelled) {
 			if (serverQueue.length === 0) {
 				if (fetchDone) break;
 				await new Promise(r => { resolveIdle = r; });
@@ -248,6 +302,7 @@ async function scanSlicePipelined(job, userId, thumbnailUrl48, placeId, slice, f
 	await Promise.all([fetcher(), matcher()]);
 	return result ?? null;
 }
+
 async function batchMatch(server, userId, thumbnailUrl48) {
 	if (!server.playerTokens?.length) return null;
 	const body = server.playerTokens.map(t => ({
@@ -279,6 +334,7 @@ async function batchMatch(server, userId, thumbnailUrl48) {
 	}
 	return null;
 }
+
 async function resolveUser(username) {
 	const res = await apiFetch("https://users.roblox.com/v1/usernames/users", {
 		method: "POST",
@@ -290,6 +346,7 @@ async function resolveUser(username) {
 	const u = data.data[0];
 	return { userId: u.id, displayName: u.displayName || username };
 }
+
 async function resolveHeadshot(userId, size = "150x150") {
 	try {
 		const res = await apiFetch(`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=${size}&format=Png&isCircular=false`);
@@ -298,6 +355,7 @@ async function resolveHeadshot(userId, size = "150x150") {
 		return data?.data?.[0]?.imageUrl ?? "";
 	} catch { return ""; }
 }
+
 app.listen(PORT, () => {
 	console.log(`[sniper] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET ✓" : "NOT SET ✗"}`);
 });
