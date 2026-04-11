@@ -30,7 +30,11 @@ function addDonation(entry) {
 }
 
 function parseDonationLine(line) {
-  const cleaned = line.replace(/[⓪ⓡ®⊙Ⓡ]/gu, "").replace(/R\$\s*/g, "").trim();
+  const cleaned = line
+    .replace(/<:[^:]+:\d+>/g, "")
+    .replace(/[⓪ⓡ®⊙Ⓡ]/gu, "")
+    .replace(/R\$\s*/g, "")
+    .trim();
   const m = cleaned.match(/^(.+?)\s*->\s*(.+?)\s+([\d,]+)\s*$/);
   if (!m) return null;
   const donor = m[1].trim();
@@ -63,7 +67,6 @@ async function startDiscordListener() {
   });
 
   client.once("ready", async () => {
-    console.log(`[discord] ${client.user.tag} | channel ${DISCORD_CHANNEL}`);
     try {
       const ch = await client.channels.fetch(DISCORD_CHANNEL);
       if (ch) {
@@ -73,7 +76,6 @@ async function startDiscordListener() {
             addDonation({ ...entry, id: msg.id + "_" + entry.donor, ts: msg.createdTimestamp });
           }
         }
-        console.log(`[discord] preloaded ${donationStore.length} donations`);
       }
     } catch {}
   });
@@ -82,11 +84,10 @@ async function startDiscordListener() {
     if (msg.channelId !== DISCORD_CHANNEL) return;
     for (const entry of parseMessage(msg.content)) {
       addDonation({ ...entry, id: msg.id + "_" + entry.donor, ts: msg.createdTimestamp });
-      console.log(`[discord] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
     }
   });
 
-  client.login(DISCORD_TOKEN).catch(err => console.error("[discord] login failed:", err.message));
+  client.login(DISCORD_TOKEN).catch(() => {});
 }
 
 function robloxHeaders() {
@@ -167,14 +168,7 @@ async function batchMatchServer(server, targetUserId, thumbnailUrls) {
   const batchRequests = tokens.map((token, idx) => {
     const requestId = `req_${idx}_${token}`;
     tokenMap.set(requestId, token);
-    return {
-      requestId,
-      token,
-      type: "AvatarHeadShot",
-      size: "48x48",
-      format: "png",
-      isCircular: false
-    };
+    return { requestId, token, type: "AvatarHeadShot", size: "48x48", format: "png", isCircular: false };
   });
   try {
     const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
@@ -240,9 +234,7 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
         if (servers.length) { serverQueue.push(...servers); notifyQueue(); }
         cursor = nextCursor;
         if (!cursor) break;
-      } catch {
-        break;
-      }
+      } catch { break; }
     }
     fetchersFinished++;
     if (fetchersFinished === totalFetchers) notifyQueue();
@@ -431,7 +423,6 @@ app.post("/presence-check", async (req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`[sniper] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET ✓" : "NOT SET ✗"}`);
   startLiveBroadcast();
   startDiscordListener();
 });
