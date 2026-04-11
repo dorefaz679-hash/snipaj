@@ -2,7 +2,6 @@ const express = require("express");
 const fetch = require("node-fetch");
 const { randomUUID } = require("crypto");
 const WebSocket = require("ws");
-const { Client, GatewayIntentBits } = require("discord.js");
 
 const app = express();
 app.use(express.json());
@@ -13,8 +12,7 @@ const DEFAULT_PLACE_ID = process.env.PLACE_ID || "8737602449";
 const MIN_CAPACITY_RATIO = parseFloat(process.env.MIN_CAPACITY_RATIO || "0.0");
 const MAX_WORKERS = parseInt(process.env.MAX_WORKERS || "12");
 const JOB_TTL_MS = 20 * 60 * 1000;
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN || "";
-const DISCORD_CHANNEL = process.env.DISCORD_CHANNEL || "1388960964489248849";
+const DONATION_SECRET = process.env.DONATION_SECRET || "changeme";
 
 const jobs = new Map();
 const liveSubscribers = new Map();
@@ -27,102 +25,6 @@ const donationStore = [];
 function addDonation(entry) {
   donationStore.unshift(entry);
   if (donationStore.length > MAX_DONATIONS) donationStore.length = MAX_DONATIONS;
-}
-
-function parseDonationLine(line) {
-  const cleaned = line
-    .replace(/<:[^:]+:\d+>/g, "")
-    .replace(/[⓪ⓡ®⊙Ⓡ]/gu, "")
-    .replace(/R\$\s*/g, "")
-    .trim();
-  const m = cleaned.match(/^(.+?)\s*->\s*(.+?)\s+([\d,]+)\s*$/);
-  if (!m) return null;
-  const donor = m[1].trim();
-  const receiver = m[2].trim();
-  const robux = parseInt(m[3].replace(/,/g, ""), 10);
-  if (isNaN(robux)) return null;
-  return { donor, receiver, robux, raw: line.trim() };
-}
-
-function parseMessage(content) {
-  const results = [];
-  for (const line of content.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const parsed = parseDonationLine(trimmed);
-    if (parsed) results.push(parsed);
-  }
-  return results;
-}
-
-async function fetchHistoryREST() {
-  let before = null;
-  let total = 0;
-  for (let page = 0; page < 5; page++) {
-    const url = `https://discord.com/api/v9/channels/${DISCORD_CHANNEL}/messages?limit=100` + (before ? `&before=${before}` : "");
-    let res;
-    try {
-      res = await fetch(url, {
-        headers: {
-          "Authorization": `Bot ${DISCORD_TOKEN}`,
-          "User-Agent": "DiscordBot (snipaj, 1.0)"
-        }
-      });
-    } catch (e) {
-      console.error(`[discord] REST history fetch error: ${e.message}`);
-      break;
-    }
-    if (!res.ok) {
-      const body = await res.text();
-      console.error(`[discord] REST history HTTP ${res.status}: ${body}`);
-      break;
-    }
-    const msgs = await res.json();
-    if (!msgs.length) break;
-    for (const msg of [...msgs].reverse()) {
-      for (const entry of parseMessage(msg.content)) {
-        addDonation({ ...entry, id: msg.id + "_" + entry.donor, ts: new Date(msg.timestamp).getTime() });
-        total++;
-      }
-    }
-    before = msgs[msgs.length - 1].id;
-    if (msgs.length < 100) break;
-  }
-  console.log(`[discord] REST preloaded ${total} donations (store size: ${donationStore.length})`);
-}
-
-async function startDiscordListener() {
-  if (!DISCORD_TOKEN) {
-    console.warn("[discord] DISCORD_TOKEN not set — listener disabled");
-    return;
-  }
-  console.log(`[discord] starting listener for channel ${DISCORD_CHANNEL}`);
-
-  await fetchHistoryREST();
-
-  const client = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,
-    ]
-  });
-
-  client.once("ready", () => {
-    console.log(`[discord] gateway ready as ${client.user.tag}`);
-  });
-
-  client.on("messageCreate", msg => {
-    if (msg.channelId !== DISCORD_CHANNEL) return;
-    for (const entry of parseMessage(msg.content)) {
-      addDonation({ ...entry, id: msg.id + "_" + entry.donor, ts: msg.createdTimestamp });
-      console.log(`[discord] new donation: ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
-    }
-  });
-
-  client.on("error", err => console.error(`[discord] client error: ${err.message}`));
-
-  client.login(DISCORD_TOKEN).catch(err => console.error(`[discord] login failed: ${err.message}`));
 }
 
 function robloxHeaders() {
@@ -286,7 +188,7 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
       const batch = serverQueue.splice(0, batchSize);
       const results = await Promise.allSettled(batch.map(s => batchMatchServer(s, userId, thumbnailUrls)));
       for (const res of results) {
-        if (res.status === 'fulfilled' && res.value !== null) {
+        if (res.status === "fulfilled" && res.value !== null) {
           found.value = true;
           found.result = res.value;
           return;
@@ -315,10 +217,7 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
   }
   while (workers.length < totalFetchers) workers.push(fetcher(null, "Asc", 100, workerId++));
 
-  await Promise.race([
-    Promise.allSettled(workers),
-    matcher()
-  ]);
+  await Promise.race([Promise.allSettled(workers), matcher()]);
   return found.result;
 }
 
@@ -397,10 +296,18 @@ function startLiveBroadcast() {
   }, 5000);
 }
 
-app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size }));
+app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size, donations: donationStore.length }));
 
-app.get("/live-servers", (req, res) => {
-  res.json(Array.from(liveDataCache.values()));
+app.post("/donation", (req, res) => {
+  const { secret, donor, receiver, robux } = req.body;
+  if (secret !== DONATION_SECRET) return res.status(403).json({ ok: false, message: "Forbidden" });
+  if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
+  const amount = parseInt(String(robux).replace(/,/g, ""), 10);
+  if (isNaN(amount) || amount <= 0) return res.status(400).json({ ok: false, message: "Invalid robux amount" });
+  const entry = { donor: String(donor), receiver: String(receiver), robux: amount, id: randomUUID(), ts: Date.now() };
+  addDonation(entry);
+  console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
+  res.json({ ok: true });
 });
 
 app.get("/donations", (req, res) => {
@@ -411,6 +318,10 @@ app.get("/donations", (req, res) => {
 app.get("/donations/latest", (req, res) => {
   if (!donationStore.length) return res.json({ ok: true, donation: null });
   res.json({ ok: true, donation: donationStore[0] });
+});
+
+app.get("/live-servers", (req, res) => {
+  res.json(Array.from(liveDataCache.values()));
 });
 
 app.post("/resolve", async (req, res) => {
@@ -458,8 +369,8 @@ app.post("/presence-check", async (req, res) => {
 });
 
 const server = app.listen(PORT, () => {
+  console.log(`[server] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET" : "NOT SET"} | DONATION_SECRET:${DONATION_SECRET !== "changeme" ? "SET" : "USING DEFAULT - CHANGE THIS"}`);
   startLiveBroadcast();
-  startDiscordListener();
 });
 
 const wss = new WebSocket.Server({ server, path: "/live" });
