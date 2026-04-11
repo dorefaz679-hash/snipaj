@@ -2,6 +2,7 @@ const express = require("express");
 const fetch = require("node-fetch");
 const { randomUUID } = require("crypto");
 const WebSocket = require("ws");
+const { Client, GatewayIntentBits } = require("discord.js");
 
 const app = express();
 app.use(express.json());
@@ -12,11 +13,80 @@ const DEFAULT_PLACE_ID = process.env.PLACE_ID || "8737602449";
 const MIN_CAPACITY_RATIO = parseFloat(process.env.MIN_CAPACITY_RATIO || "0.0");
 const MAX_WORKERS = parseInt(process.env.MAX_WORKERS || "12");
 const JOB_TTL_MS = 20 * 60 * 1000;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN || "";
+const DISCORD_CHANNEL = process.env.DISCORD_CHANNEL || "1388960964489248849";
 
 const jobs = new Map();
 const liveSubscribers = new Map();
 const liveDataCache = new Map();
 let liveBroadcastInterval = null;
+
+const MAX_DONATIONS = 200;
+const donationStore = [];
+
+function addDonation(entry) {
+  donationStore.unshift(entry);
+  if (donationStore.length > MAX_DONATIONS) donationStore.length = MAX_DONATIONS;
+}
+
+function parseDonationLine(line) {
+  const cleaned = line.replace(/[⓪ⓡ®⊙Ⓡ]/gu, "").replace(/R\$\s*/g, "").trim();
+  const m = cleaned.match(/^(.+?)\s*->\s*(.+?)\s+([\d,]+)\s*$/);
+  if (!m) return null;
+  const donor = m[1].trim();
+  const receiver = m[2].trim();
+  const robux = parseInt(m[3].replace(/,/g, ""), 10);
+  if (isNaN(robux)) return null;
+  return { donor, receiver, robux, raw: line.trim() };
+}
+
+function parseMessage(content) {
+  const results = [];
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const parsed = parseDonationLine(trimmed);
+    if (parsed) results.push(parsed);
+  }
+  return results;
+}
+
+function startDiscordListener() {
+  if (!DISCORD_TOKEN) return;
+
+  const client = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+    ]
+  });
+
+  client.once("ready", () => {
+    console.log(`[discord] ${client.user.tag} | channel ${DISCORD_CHANNEL}`);
+    const ch = client.channels.cache.get(DISCORD_CHANNEL);
+    if (ch) {
+      ch.messages.fetch({ limit: 100 }).then(msgs => {
+        for (const msg of [...msgs.values()].reverse()) {
+          for (const entry of parseMessage(msg.content)) {
+            addDonation({ ...entry, id: msg.id + "_" + entry.donor, ts: msg.createdTimestamp });
+          }
+        }
+        console.log(`[discord] preloaded ${donationStore.length} donations`);
+      }).catch(() => {});
+    }
+  });
+
+  client.on("messageCreate", msg => {
+    if (msg.channelId !== DISCORD_CHANNEL) return;
+    for (const entry of parseMessage(msg.content)) {
+      addDonation({ ...entry, id: msg.id + "_" + entry.donor, ts: msg.createdTimestamp });
+      console.log(`[discord] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
+    }
+  });
+
+  client.login(DISCORD_TOKEN).catch(err => console.error("[discord] login failed:", err.message));
+}
 
 function robloxHeaders() {
   return {
@@ -36,10 +106,7 @@ async function apiFetch(url, opts = {}, retries = 5) {
         ...opts,
         headers: { ...robloxHeaders(), ...(opts.headers || {}) }
       });
-      if (res.status === 429) {
-        await sleep(3500 * (i + 1));
-        continue;
-      }
+      if (res.status === 429) { await sleep(3500 * (i + 1)); continue; }
       return res;
     } catch (e) {
       if (i === retries - 1) throw e;
@@ -67,9 +134,7 @@ async function resolveHeadshot(userId, size = "150x150") {
     );
     const data = await res.json();
     return data?.data?.[0]?.imageUrl || "";
-  } catch {
-    return "";
-  }
+  } catch { return ""; }
 }
 
 async function getPresenceStatus(userId, placeId) {
@@ -91,9 +156,7 @@ async function getPresenceStatus(userId, placeId) {
       gameId: p.gameId || null,
       placeId: String(p.rootPlaceId || p.placeId || "")
     };
-  } catch {
-    return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
-  }
+  } catch { return { type: "unknown", inGame: false, inThisGame: false, gameId: null }; }
 }
 
 async function batchMatchServer(server, targetUserId, thumbnailUrls) {
@@ -101,37 +164,25 @@ async function batchMatchServer(server, targetUserId, thumbnailUrls) {
   const tokens = server.playerTokens.slice(0, 100);
   const batchRequests = tokens.map(token => ({
     requestId: `0:${token}:AvatarHeadShot:48x48:png:regular`,
-    token,
-    type: "AvatarHeadShot",
-    size: "48x48",
-    format: "png",
-    isCircular: false
+    token, type: "AvatarHeadShot", size: "48x48", format: "png", isCircular: false
   }));
   try {
     const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
-      method: "POST",
-      headers: robloxHeaders(),
-      body: JSON.stringify(batchRequests)
+      method: "POST", headers: robloxHeaders(), body: JSON.stringify(batchRequests)
     });
     if (!res.ok) return null;
     const data = await res.json();
     for (const entry of data.data || []) {
       if (!entry) continue;
-      if (entry.targetId && String(entry.targetId) === targetUserId) {
-        return { serverId: server.id, matchType: "userId" };
-      }
+      if (entry.targetId && String(entry.targetId) === targetUserId) return { serverId: server.id, matchType: "userId" };
       if (entry.imageUrl) {
         for (const thumb of thumbnailUrls) {
-          if (thumb && entry.imageUrl === thumb) {
-            return { serverId: server.id, matchType: "thumbnail" };
-          }
+          if (thumb && entry.imageUrl === thumb) return { serverId: server.id, matchType: "thumbnail" };
         }
       }
     }
     return null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function fetchServersPage(placeId, sortOrder, limit, cursor = null) {
@@ -156,34 +207,22 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
   const found = { value: false, result: null };
   const serverQueue = [];
   let queueResolve = null;
-  let activeFetchers = 0;
   let fetchersFinished = 0;
   const totalFetchers = workerCount * 2;
   const sortOrders = ["Asc", "Desc"];
   const limits = [100, 50];
   const maxPages = 15;
 
-  const notifyQueue = () => {
-    if (queueResolve) {
-      const r = queueResolve;
-      queueResolve = null;
-      r();
-    }
-  };
+  const notifyQueue = () => { if (queueResolve) { const r = queueResolve; queueResolve = null; r(); } };
 
   const fetcher = async (startCursor, sortOrder, limit, workerId) => {
     let cursor = startCursor;
-    let pages = 0;
-    let seen = 0;
+    let pages = 0, seen = 0;
     while (!found.value && !job.cancelled && pages < maxPages) {
       const { servers, nextCursor } = await fetchServersPage(placeId, sortOrder, limit, cursor);
-      seen += servers.length;
-      pages++;
+      seen += servers.length; pages++;
       job.step = `W${workerId} ${sortOrder} L${limit} p${pages} s${seen}`;
-      if (servers.length) {
-        serverQueue.push(...servers);
-        notifyQueue();
-      }
+      if (servers.length) { serverQueue.push(...servers); notifyQueue(); }
       cursor = nextCursor;
       if (!cursor) break;
     }
@@ -202,28 +241,14 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
       const batch = serverQueue.splice(0, batchSize);
       const results = await Promise.all(batch.map(s => batchMatchServer(s, userId, thumbnailUrls)));
       const hit = results.find(r => r !== null);
-      if (hit) {
-        found.value = true;
-        found.result = hit;
-        return;
-      }
+      if (hit) { found.value = true; found.result = hit; return; }
     }
   };
 
   const startCursors = await Promise.all([
     (async () => null)(),
-    (async () => {
-      try {
-        const { nextCursor } = await fetchServersPage(placeId, "Asc", 100);
-        return nextCursor;
-      } catch { return null; }
-    })(),
-    (async () => {
-      try {
-        const { nextCursor } = await fetchServersPage(placeId, "Desc", 100);
-        return nextCursor;
-      } catch { return null; }
-    })()
+    (async () => { try { const { nextCursor } = await fetchServersPage(placeId, "Asc", 100); return nextCursor; } catch { return null; } })(),
+    (async () => { try { const { nextCursor } = await fetchServersPage(placeId, "Desc", 100); return nextCursor; } catch { return null; } })()
   ]);
 
   const workers = [];
@@ -238,9 +263,7 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
       }
     }
   }
-  while (workers.length < totalFetchers) {
-    workers.push(fetcher(null, "Asc", 100, workerId++));
-  }
+  while (workers.length < totalFetchers) workers.push(fetcher(null, "Asc", 100, workerId++));
 
   await Promise.race([Promise.all(workers), matcher()]);
   return found.result;
@@ -252,11 +275,7 @@ async function runSearch(jobId, username, placeId, instanceCount) {
   try {
     job.step = `Resolving ${username}...`;
     const { userId, displayName } = await resolveUser(username);
-    if (!userId) {
-      job.status = "done";
-      job.result = { found: false, message: `User "${username}" does not exist` };
-      return;
-    }
+    if (!userId) { job.status = "done"; job.result = { found: false, message: `User "${username}" does not exist` }; return; }
     job.userId = userId;
 
     const [thumb150, thumb48, thumb720] = await Promise.all([
@@ -268,28 +287,11 @@ async function runSearch(jobId, username, placeId, instanceCount) {
     job.step = "Checking presence...";
     const presence = await getPresenceStatus(userId, placeId);
 
-    if (presence.type === "offline") {
-      job.status = "done";
-      job.result = { found: false, message: `${displayName} is offline`, presenceStatus: "offline" };
-      return;
-    }
-    if (presence.type === "online") {
-      job.status = "done";
-      job.result = { found: false, message: `${displayName} is on website but not in game`, presenceStatus: "online" };
-      return;
-    }
+    if (presence.type === "offline") { job.status = "done"; job.result = { found: false, message: `${displayName} is offline`, presenceStatus: "offline" }; return; }
+    if (presence.type === "online") { job.status = "done"; job.result = { found: false, message: `${displayName} is on website but not in game`, presenceStatus: "online" }; return; }
     if (presence.inGame && presence.gameId && presence.inThisGame) {
       job.status = "done";
-      job.result = {
-        found: true,
-        serverId: presence.gameId,
-        placeId: String(placeId),
-        userId: String(userId),
-        displayName,
-        thumbnailUrl: thumb150,
-        foundInInstance: 1,
-        matchType: "presence"
-      };
+      job.result = { found: true, serverId: presence.gameId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: 1, matchType: "presence" };
       return;
     }
 
@@ -302,24 +304,11 @@ async function runSearch(jobId, username, placeId, instanceCount) {
     job.status = "done";
 
     if (result) {
-      job.result = {
-        found: true,
-        serverId: result.serverId,
-        placeId: String(placeId),
-        userId: String(userId),
-        displayName,
-        thumbnailUrl: thumb150,
-        foundInInstance: 1,
-        matchType: result.matchType
-      };
+      job.result = { found: true, serverId: result.serverId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: 1, matchType: result.matchType };
     } else {
       const finalPresence = await getPresenceStatus(userId, placeId);
       const privateGuess = finalPresence.inGame && finalPresence.inThisGame;
-      job.result = {
-        found: false,
-        message: privateGuess ? "Player is likely in a private server" : "Player not found in any public server",
-        possiblePrivate: true
-      };
+      job.result = { found: false, message: privateGuess ? "Player is likely in a private server" : "Player not found in any public server", possiblePrivate: true };
     }
   } catch (err) {
     if (job.cancelled) return;
@@ -338,45 +327,34 @@ function startLiveBroadcast() {
       for (const s of servers.slice(0, 30)) {
         const tokens = s.playerTokens.slice(0, 10);
         if (!tokens.length) continue;
-        const batchRequests = tokens.map(t => ({
-          requestId: `0:${t}:AvatarHeadShot:48x48:png:regular`,
-          token: t,
-          type: "AvatarHeadShot",
-          size: "48x48",
-          format: "png",
-          isCircular: false
-        }));
+        const batchRequests = tokens.map(t => ({ requestId: `0:${t}:AvatarHeadShot:48x48:png:regular`, token: t, type: "AvatarHeadShot", size: "48x48", format: "png", isCircular: false }));
         try {
-          const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
-            method: "POST",
-            headers: robloxHeaders(),
-            body: JSON.stringify(batchRequests)
-          });
+          const res = await fetch("https://thumbnails.roblox.com/v1/batch", { method: "POST", headers: robloxHeaders(), body: JSON.stringify(batchRequests) });
           const data = await res.json();
           const thumbs = {};
-          for (const e of data.data || []) {
-            if (e.token) thumbs[e.token] = e.imageUrl;
-          }
-          enriched.push({
-            id: s.id,
-            playing: s.playing,
-            maxPlayers: s.maxPlayers,
-            playerTokens: s.playerTokens,
-            thumbnails: thumbs
-          });
+          for (const e of data.data || []) { if (e.token) thumbs[e.token] = e.imageUrl; }
+          enriched.push({ id: s.id, playing: s.playing, maxPlayers: s.maxPlayers, playerTokens: s.playerTokens, thumbnails: thumbs });
         } catch {}
       }
       liveDataCache.clear();
       enriched.forEach(s => liveDataCache.set(s.id, s));
       const payload = JSON.stringify(Array.from(liveDataCache.values()));
-      for (const ws of liveSubscribers.values()) {
-        if (ws.readyState === WebSocket.OPEN) ws.send(payload);
-      }
+      for (const ws of liveSubscribers.values()) { if (ws.readyState === WebSocket.OPEN) ws.send(payload); }
     } catch {}
   }, 5000);
 }
 
 app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size }));
+
+app.get("/donations", (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || "50", 10), MAX_DONATIONS);
+  res.json({ ok: true, count: Math.min(limit, donationStore.length), donations: donationStore.slice(0, limit) });
+});
+
+app.get("/donations/latest", (req, res) => {
+  if (!donationStore.length) return res.json({ ok: true, donation: null });
+  res.json({ ok: true, donation: donationStore[0] });
+});
 
 app.post("/resolve", async (req, res) => {
   const { username } = req.body;
@@ -386,9 +364,7 @@ app.post("/resolve", async (req, res) => {
     if (!user.userId) return res.json({ ok: false, message: `User "${username}" does not exist` });
     const thumbnailUrl = await resolveHeadshot(user.userId);
     res.json({ ok: true, userId: user.userId, displayName: user.displayName, thumbnailUrl });
-  } catch (err) {
-    res.status(500).json({ ok: false, message: String(err) });
-  }
+  } catch (err) { res.status(500).json({ ok: false, message: String(err) }); }
 });
 
 app.post("/search", async (req, res) => {
@@ -396,15 +372,7 @@ app.post("/search", async (req, res) => {
   if (!username) return res.status(400).json({ ok: false, message: "Missing username" });
   const jobId = randomUUID();
   const workers = Math.min(Math.max(Number(instanceCount) || 1, 1), MAX_WORKERS);
-  jobs.set(jobId, {
-    status: "running",
-    step: "Starting...",
-    result: null,
-    startedAt: Date.now(),
-    cancelled: false,
-    userId: null,
-    placeId: placeId || DEFAULT_PLACE_ID
-  });
+  jobs.set(jobId, { status: "running", step: "Starting...", result: null, startedAt: Date.now(), cancelled: false, userId: null, placeId: placeId || DEFAULT_PLACE_ID });
   res.json({ ok: true, jobId });
   runSearch(jobId, username, placeId || DEFAULT_PLACE_ID, workers);
   setTimeout(() => jobs.delete(jobId), JOB_TTL_MS);
@@ -419,9 +387,7 @@ app.get("/result/:jobId", (req, res) => {
 app.post("/cancel/:jobId", (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ ok: false, message: "Job not found" });
-  job.cancelled = true;
-  job.status = "done";
-  job.result = { found: false, message: "Cancelled" };
+  job.cancelled = true; job.status = "done"; job.result = { found: false, message: "Cancelled" };
   res.json({ ok: true });
 });
 
@@ -430,24 +396,21 @@ app.post("/presence-check", async (req, res) => {
   const job = jobs.get(jobId);
   if (!job?.userId) return res.json({ abort: false });
   const presence = await getPresenceStatus(job.userId, placeId || DEFAULT_PLACE_ID);
-  if (presence.type === "offline") {
-    return res.json({ abort: true, message: "Player went offline", presenceStatus: "offline" });
-  }
+  if (presence.type === "offline") return res.json({ abort: true, message: "Player went offline", presenceStatus: "offline" });
   res.json({ abort: false });
 });
 
 const server = app.listen(PORT, () => {
   console.log(`[sniper] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET ✓" : "NOT SET ✗"}`);
   startLiveBroadcast();
+  startDiscordListener();
 });
 
 const wss = new WebSocket.Server({ server, path: "/live" });
-wss.on("connection", (ws, req) => {
+wss.on("connection", (ws) => {
   const id = randomUUID();
   liveSubscribers.set(id, ws);
-  if (liveDataCache.size) {
-    ws.send(JSON.stringify(Array.from(liveDataCache.values())));
-  }
+  if (liveDataCache.size) ws.send(JSON.stringify(Array.from(liveDataCache.values())));
   ws.on("close", () => liveSubscribers.delete(id));
   ws.on("error", () => liveSubscribers.delete(id));
 });
