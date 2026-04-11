@@ -48,7 +48,7 @@ app.post("/search", async (req, res) => {
 	jobs.set(jobId, { status: "running", step: "Starting...", result: null, startedAt: Date.now() });
 	res.json({ ok: true, jobId });
 	runSearch(jobId, username, placeId || DEFAULT_PLACE_ID, instances);
-	setTimeout(() => jobs.delete(jobId), 10 * 60 * 1000);
+	setTimeout(() => jobs.delete(jobId), 20 * 60 * 1000);
 });
 app.get("/result/:jobId", (req, res) => {
 	const job = jobs.get(req.params.jobId);
@@ -175,30 +175,46 @@ async function scanSlicePipelined(job, userId, thumbnailUrl48, placeId, slice, f
 	let cursor = slice.startCursor;
 	let pagesScanned = 0;
 	let serversScanned = 0;
-	let nextPagePromise = apiFetch(serverListUrl(placeId, cursor));
-	while (!found.value) {
-		let res;
-		try { res = await nextPagePromise; }
-		catch { await sleep(1000); nextPagePromise = apiFetch(serverListUrl(placeId, cursor)); continue; }
-		if (!res.ok) return null;
-		const data = await res.json();
-		const nextCursor = data.nextPageCursor ?? null;
-		if (nextCursor && !found.value) {
-			nextPagePromise = apiFetch(serverListUrl(placeId, nextCursor));
+	let fetchDone = false;
+	let result = null;
+	const serverQueue = [];
+	let resolveIdle = null;
+	function notifyQueue() { if (resolveIdle) { const r = resolveIdle; resolveIdle = null; r(); } }
+	async function fetcher() {
+		let cur = cursor;
+		while (!found.value && !result) {
+			let res;
+			try { res = await apiFetch(serverListUrl(placeId, cur)); }
+			catch { await sleep(1000); continue; }
+			if (!res.ok) { fetchDone = true; notifyQueue(); return; }
+			const data = await res.json();
+			const allServers = data.data ?? [];
+			serversScanned += allServers.length;
+			pagesScanned++;
+			job.step = `${slice.label} — p${pagesScanned} | ${serversScanned} servers`;
+			const active = allServers.filter(s => s.playerTokens?.length > 0);
+			if (active.length > 0) { serverQueue.push(...active); notifyQueue(); }
+			cur = data.nextPageCursor ?? null;
+			if (!cur) break;
 		}
-		const allServers = data.data ?? [];
-		const active = allServers.filter(s => s.playerTokens?.length > 0);
-		serversScanned += allServers.length;
-		job.step = `${slice.label} — p${pagesScanned + 1} | ${serversScanned} servers`;
-		if (active.length > 0 && !found.value) {
-			const hit = await scanServers(active, userId, thumbnailUrl48, found);
-			if (hit) return hit;
-		}
-		cursor = nextCursor;
-		pagesScanned++;
-		if (!cursor) return null;
+		fetchDone = true;
+		notifyQueue();
 	}
-	return null;
+	async function matcher() {
+		while (!found.value && !result) {
+			if (serverQueue.length === 0) {
+				if (fetchDone) break;
+				await new Promise(r => { resolveIdle = r; });
+				continue;
+			}
+			const batch = serverQueue.splice(0, 20);
+			const hits = await Promise.all(batch.map(s => batchMatch(s, userId, thumbnailUrl48)));
+			const hit = hits.find(h => h != null);
+			if (hit) { result = hit; return; }
+		}
+	}
+	await Promise.all([fetcher(), matcher()]);
+	return result ?? null;
 }
 async function scanServers(servers, userId, thumbnailUrl48, found) {
 	const CONCURRENCY = 80;
