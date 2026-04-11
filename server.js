@@ -115,7 +115,7 @@ async function checkPresence(userId, placeId) {
 	} catch { return null; }
 }
 async function buildCursorMap(job, placeId, instanceCount) {
-	const CHUNK = [10, 40, 100, 150, 699];
+	const CHUNK = [10, 40, 100, 150, 200];
 	const slices = CHUNK.slice(0, instanceCount);
 	const splitPoints = [null];
 	let pipelineCursor = null;
@@ -144,7 +144,7 @@ async function buildCursorMap(job, placeId, instanceCount) {
 	return splitPoints.slice(0, instanceCount).map((startCursor, i) => {
 		let start = 1;
 		for (let j = 0; j < i; j++) start += slices[j];
-		return { instance: i + 1, startCursor, pageLimit: slices[i], label: `I${i + 1}[p${start}–${start + slices[i] - 1}]` };
+		return { instance: i + 1, startCursor, label: `I${i + 1}[from p${start}]` };
 	});
 }
 function serverListUrl(placeId, cursor) {
@@ -176,14 +176,14 @@ async function scanSlicePipelined(job, userId, thumbnailUrl48, placeId, slice, f
 	let pagesScanned = 0;
 	let serversScanned = 0;
 	let nextPagePromise = apiFetch(serverListUrl(placeId, cursor));
-	while (pagesScanned < slice.pageLimit && !found.value) {
+	while (!found.value) {
 		let res;
 		try { res = await nextPagePromise; }
 		catch { await sleep(1000); nextPagePromise = apiFetch(serverListUrl(placeId, cursor)); continue; }
 		if (!res.ok) return null;
 		const data = await res.json();
 		const nextCursor = data.nextPageCursor ?? null;
-		if (nextCursor && pagesScanned + 1 < slice.pageLimit && !found.value) {
+		if (nextCursor && !found.value) {
 			nextPagePromise = apiFetch(serverListUrl(placeId, nextCursor));
 		}
 		const allServers = data.data ?? [];
