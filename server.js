@@ -55,6 +55,31 @@ app.get("/result/:jobId", (req, res) => {
 	if (!job) return res.status(404).json({ ok: false, message: "Job not found or expired" });
 	res.json({ ok: true, status: job.status, step: job.step, result: job.result });
 });
+async function getPresenceStatus(userId) {
+	if (!ROBLOSECURITY) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
+	try {
+		const res = await apiFetch("https://presence.roblox.com/v1/presence/users", {
+			method: "POST",
+			body: JSON.stringify({ userIds: [Number(userId)] }),
+		});
+		if (!res.ok) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
+		const data = await res.json();
+		const p = data?.userPresences?.[0];
+		if (!p) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
+		const presenceType = p.userPresenceType;
+		const inGame = presenceType === 2;
+		const inThisGame = inGame && String(p.rootPlaceId || p.placeId || "") === String(DEFAULT_PLACE_ID);
+		return {
+			type: presenceType === 0 ? "offline" : presenceType === 1 ? "online" : presenceType === 2 ? "ingame" : "unknown",
+			inGame,
+			inThisGame,
+			gameId: p.gameId || null,
+			placeId: String(p.rootPlaceId || p.placeId || ""),
+		};
+	} catch {
+		return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
+	}
+}
 async function runSearch(jobId, username, placeId, instanceCount) {
 	const job = jobs.get(jobId);
 	if (!job) return;
@@ -70,11 +95,33 @@ async function runSearch(jobId, username, placeId, instanceCount) {
 			resolveHeadshot(userId, "150x150"),
 			resolveHeadshot(userId, "48x48"),
 		]);
-		job.step = "Checking live presence...";
-		const presenceGameId = await checkPresence(userId, placeId);
-		if (presenceGameId) {
+		job.step = "Checking presence...";
+		const presence = await getPresenceStatus(userId);
+		if (presence.type === "offline") {
 			job.status = "done";
-			job.result = { found: true, serverId: presenceGameId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: 1, matchType: "presence" };
+			job.result = { found: false, message: `${displayName} is offline`, presenceStatus: "offline" };
+			return;
+		}
+		if (presence.type === "online") {
+			job.status = "done";
+			job.result = { found: false, message: `${displayName} is on the Roblox website but not in any game`, presenceStatus: "online" };
+			return;
+		}
+		if (presence.type === "unknown" && !ROBLOSECURITY) {
+			job.step = "No ROBLOSECURITY — skipping presence gate, scanning servers...";
+		} else if (!presence.inGame) {
+			job.status = "done";
+			job.result = { found: false, message: `${displayName} is not currently in a game`, presenceStatus: presence.type };
+			return;
+		}
+		if (presence.inGame && !presence.inThisGame) {
+			job.status = "done";
+			job.result = { found: false, message: `${displayName} is in a different game, not this one`, presenceStatus: "othergame" };
+			return;
+		}
+		if (presence.inGame && presence.gameId) {
+			job.status = "done";
+			job.result = { found: true, serverId: presence.gameId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: 1, matchType: "presence" };
 			return;
 		}
 		job.step = `Building ${instanceCount}-instance cursor map...`;
@@ -98,21 +145,6 @@ async function runSearch(jobId, username, placeId, instanceCount) {
 		job.status = "done";
 		job.result = { found: false, message: "Internal error: " + err.message };
 	}
-}
-async function checkPresence(userId, placeId) {
-	if (!ROBLOSECURITY) return null;
-	try {
-		const res = await apiFetch("https://presence.roblox.com/v1/presence/users", {
-			method: "POST",
-			body: JSON.stringify({ userIds: [Number(userId)] }),
-		});
-		if (!res.ok) return null;
-		const data = await res.json();
-		const p = data?.userPresences?.[0];
-		if (!p || p.userPresenceType !== 2) return null;
-		if (String(p.rootPlaceId || p.placeId || "") !== String(placeId)) return null;
-		return p.gameId || null;
-	} catch { return null; }
 }
 async function buildCursorMap(job, placeId, instanceCount) {
 	const CHUNK = [10, 40, 100, 150, 200];
@@ -215,34 +247,6 @@ async function scanSlicePipelined(job, userId, thumbnailUrl48, placeId, slice, f
 	}
 	await Promise.all([fetcher(), matcher()]);
 	return result ?? null;
-}
-async function scanServers(servers, userId, thumbnailUrl48, found) {
-	const CONCURRENCY = 80;
-	return new Promise((resolve) => {
-		let resolved = false;
-		let pending = servers.length;
-		let idx = 0;
-		let active = 0;
-		function dispatch() {
-			while (active < CONCURRENCY && idx < servers.length && !found?.value) {
-				const server = servers[idx++];
-				active++;
-				batchMatch(server, userId, thumbnailUrl48).then(result => {
-					active--;
-					if (resolved || found?.value) { dispatch(); return; }
-					if (result) { resolved = true; resolve(result); return; }
-					if (--pending === 0) resolve(null);
-					else dispatch();
-				}).catch(() => {
-					active--;
-					if (!resolved && --pending === 0) resolve(null);
-					else dispatch();
-				});
-			}
-			if (idx >= servers.length && active === 0 && !resolved) resolve(null);
-		}
-		dispatch();
-	});
 }
 async function batchMatch(server, userId, thumbnailUrl48) {
 	if (!server.playerTokens?.length) return null;
