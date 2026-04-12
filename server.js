@@ -319,10 +319,7 @@ app.post("/donation", async (req, res) => {
   if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
   const amount = parseInt(String(robux).replace(/,/g, ""), 10);
   if (isNaN(amount) || amount <= 1000) return res.status(400).json({ ok: false, message: "Amount must be above 1000" });
-
   let serverId = null;
-  let ttl = DONATION_TTL_MS;
-
   if (receiverHasJoin || donorHasJoin) {
     const presenceChecks = [];
     if (receiverHasJoin) presenceChecks.push(checkPresenceForJoin(receiver));
@@ -331,15 +328,7 @@ app.post("/donation", async (req, res) => {
     for (const result of results) {
       if (result) { serverId = result; break; }
     }
-    if (serverId) {
-      ttl = 30 * 1000;
-    } else {
-      return res.json({ ok: true, skipped: true });
-    }
-  } else {
-    return res.json({ ok: true, skipped: true });
   }
-
   const entry = {
     donor: String(donor),
     receiver: String(receiver),
@@ -348,15 +337,13 @@ app.post("/donation", async (req, res) => {
     ts: Date.now(),
     serverId: serverId || null
   };
-
   addDonation(entry);
-
-  setTimeout(() => {
-    const idx = donationStore.findIndex(d => d.id === entry.id);
-    if (idx !== -1) donationStore.splice(idx, 1);
-  }, ttl);
-
-  console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$ serverId:${serverId || "none"} ttl:${ttl/1000}s`);
+  if (serverId) {
+    setTimeout(() => {
+      const idx = donationStore.findIndex(d => d.id === entry.id);
+      if (idx !== -1) donationStore.splice(idx, 1);
+    }, 30 * 1000);
+  }
   res.json({ ok: true });
 });
 
