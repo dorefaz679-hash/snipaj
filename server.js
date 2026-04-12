@@ -318,7 +318,7 @@ app.post("/donation", async (req, res) => {
   if (secret !== DONATION_SECRET) return res.status(403).json({ ok: false, message: "Forbidden" });
   if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
   const amount = parseInt(String(robux).replace(/,/g, ""), 10);
-  if (isNaN(amount) || amount <= 1000) return res.status(400).json({ ok: false, message: "Amount must be above 1000" });
+  if (isNaN(amount) || amount < 1000) return res.status(400).json({ ok: false, message: "Amount must be 1000 or above" });
   let serverId = null;
   if (receiverHasJoin || donorHasJoin) {
     const presenceChecks = [];
