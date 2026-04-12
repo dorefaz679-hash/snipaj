@@ -12,7 +12,7 @@ const DEFAULT_PLACE_ID = process.env.PLACE_ID || "8737602449";
 const MIN_CAPACITY_RATIO = parseFloat(process.env.MIN_CAPACITY_RATIO || "0.0");
 const MAX_WORKERS = parseInt(process.env.MAX_WORKERS || "12");
 const JOB_TTL_MS = 20 * 60 * 1000;
-const DONATION_SECRET = process.env.DONATION_SECRET || "changeme";
+const DONATION_SECRET = process.env.DONATION_SECRET || "phonktobiboy!";
 
 const jobs = new Map();
 const liveSubscribers = new Map();
@@ -301,17 +301,46 @@ function startLiveBroadcast() {
   }, 5000);
 }
 
+async function checkPresenceForJoin(username) {
+  try {
+    const { userId } = await resolveUser(username);
+    if (!userId) return null;
+    const presence = await getPresenceStatus(userId, DEFAULT_PLACE_ID);
+    if (presence.inGame && presence.gameId && presence.inThisGame) return presence.gameId;
+    return null;
+  } catch { return null; }
+}
+
 app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size, donations: donationStore.length }));
 
-app.post("/donation", (req, res) => {
-  const { secret, donor, receiver, robux } = req.body;
+app.post("/donation", async (req, res) => {
+  const { secret, donor, receiver, robux, donorHasJoin, receiverHasJoin } = req.body;
   if (secret !== DONATION_SECRET) return res.status(403).json({ ok: false, message: "Forbidden" });
   if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
   const amount = parseInt(String(robux).replace(/,/g, ""), 10);
-  if (isNaN(amount) || amount <= 0) return res.status(400).json({ ok: false, message: "Invalid robux amount" });
-  const entry = { donor: String(donor), receiver: String(receiver), robux: amount, id: randomUUID(), ts: Date.now() };
+  if (isNaN(amount) || amount <= 1000) return res.status(400).json({ ok: false, message: "Amount must be above 1000" });
+
+  let serverId = null;
+
+  const presenceChecks = [];
+  if (receiverHasJoin) presenceChecks.push(checkPresenceForJoin(receiver));
+  if (donorHasJoin) presenceChecks.push(checkPresenceForJoin(donor));
+
+  const results = await Promise.all(presenceChecks);
+  for (const result of results) {
+    if (result) { serverId = result; break; }
+  }
+
+  const entry = {
+    donor: String(donor),
+    receiver: String(receiver),
+    robux: amount,
+    id: randomUUID(),
+    ts: Date.now(),
+    serverId: serverId || null
+  };
   addDonation(entry);
-  console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
+  console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$ serverId:${serverId || "none"}`);
   res.json({ ok: true });
 });
 
