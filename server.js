@@ -8,6 +8,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const ROBLOSECURITY = process.env.ROBLOSECURITY || "";
+const DEFAULT_UNIVERSE_ID = process.env.UNIVERSE_ID || "3317679266";
 const DEFAULT_PLACE_ID = process.env.PLACE_ID || "8737602449";
 const MIN_CAPACITY_RATIO = parseFloat(process.env.MIN_CAPACITY_RATIO || "0.0");
 const MAX_WORKERS = parseInt(process.env.MAX_WORKERS || "12");
@@ -76,6 +77,20 @@ async function resolveHeadshot(userId, size = "150x150") {
   } catch { return ""; }
 }
 
+async function getUniverseIdForUser(userId) {
+  if (!ROBLOSECURITY) return null;
+  try {
+    const res = await apiFetch("https://presence.roblox.com/v1/presence/users", {
+      method: "POST",
+      body: JSON.stringify({ userIds: [Number(userId)] })
+    });
+    const data = await res.json();
+    const p = data?.userPresences?.[0];
+    if (!p || p.userPresenceType !== 2) return null;
+    return { gameId: p.gameId || null, placeId: String(p.rootPlaceId || p.placeId || ""), universeId: null };
+  } catch { return null; }
+}
+
 async function getPresenceStatus(userId, placeId) {
   if (!ROBLOSECURITY) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
   try {
@@ -87,12 +102,13 @@ async function getPresenceStatus(userId, placeId) {
     const p = data?.userPresences?.[0];
     if (!p) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
     const inGame = p.userPresenceType === 2;
-    const inThisGame = inGame && String(p.rootPlaceId || p.placeId || "") === String(placeId || DEFAULT_PLACE_ID);
+    const userPlaceId = String(p.rootPlaceId || p.placeId || "");
+    const inThisGame = inGame && (userPlaceId === String(placeId) || p.universeId === Number(DEFAULT_UNIVERSE_ID));
     return {
       type: p.userPresenceType === 0 ? "offline" : p.userPresenceType === 1 ? "online" : p.userPresenceType === 2 ? "ingame" : "unknown",
       inGame, inThisGame,
       gameId: p.gameId || null,
-      placeId: String(p.rootPlaceId || p.placeId || "")
+      placeId: userPlaceId
     };
   } catch { return { type: "unknown", inGame: false, inThisGame: false, gameId: null }; }
 }
@@ -101,9 +117,18 @@ async function checkPresenceForJoin(username) {
   try {
     const { userId } = await resolveUser(username);
     if (!userId) return null;
-    const presence = await getPresenceStatus(userId, DEFAULT_PLACE_ID);
-    console.log(`[presence] ${username} inGame:${presence.inGame} inThisGame:${presence.inThisGame} gameId:${presence.gameId}`);
-    if (presence.inGame && presence.gameId && presence.inThisGame) return presence.gameId;
+    if (!ROBLOSECURITY) return null;
+    const res = await apiFetch("https://presence.roblox.com/v1/presence/users", {
+      method: "POST",
+      body: JSON.stringify({ userIds: [Number(userId)] })
+    });
+    const data = await res.json();
+    const p = data?.userPresences?.[0];
+    if (!p || p.userPresenceType !== 2) return null;
+    const userPlaceId = String(p.rootPlaceId || p.placeId || "");
+    const inThisGame = userPlaceId === String(DEFAULT_PLACE_ID) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID);
+    console.log(`[presence] ${username} inGame:true inThisGame:${inThisGame} gameId:${p.gameId} placeId:${userPlaceId} universeId:${p.universeId}`);
+    if (inThisGame && p.gameId) return p.gameId;
     return null;
   } catch (e) {
     console.log(`[presence error] ${username} ${e.message}`);
@@ -295,38 +320,20 @@ app.post("/donation", async (req, res) => {
   if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
   const amount = parseInt(String(robux).replace(/,/g, ""), 10);
   if (isNaN(amount) || amount < 1000) return res.status(400).json({ ok: false, message: "Amount must be 1000 or above" });
-
-  const entry = {
-    donor: String(donor),
-    receiver: String(receiver),
-    robux: amount,
-    id: randomUUID(),
-    ts: Date.now(),
-    serverId: null
-  };
-
+  const entry = { donor: String(donor), receiver: String(receiver), robux: amount, id: randomUUID(), ts: Date.now(), serverId: null };
   addDonation(entry);
   console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
-
   res.json({ ok: true });
-
   if (ROBLOSECURITY) {
     try {
-      const [donorServerId, receiverServerId] = await Promise.all([
-        checkPresenceForJoin(donor),
-        checkPresenceForJoin(receiver)
-      ]);
+      const [donorServerId, receiverServerId] = await Promise.all([checkPresenceForJoin(donor), checkPresenceForJoin(receiver)]);
       const foundServerId = donorServerId || receiverServerId;
       if (foundServerId) {
         entry.serverId = foundServerId;
-        console.log(`[donation] updated serverId:${foundServerId} for ${entry.id}`);
-        setTimeout(() => {
-          entry.serverId = null;
-        }, SERVER_ID_TTL_MS);
+        console.log(`[donation] serverId updated:${foundServerId} for ${entry.id}`);
+        setTimeout(() => { entry.serverId = null; }, SERVER_ID_TTL_MS);
       }
-    } catch (e) {
-      console.log(`[donation presence error] ${e.message}`);
-    }
+    } catch (e) { console.log(`[donation presence error] ${e.message}`); }
   }
 });
 
@@ -342,6 +349,12 @@ app.get("/donations/latest", (req, res) => {
   const active = donationStore.filter(d => (now - d.ts) < DONATION_TTL_MS);
   if (!active.length) return res.json({ ok: true, donation: null });
   res.json({ ok: true, donation: active[0] });
+});
+
+app.get("/donation/:id", (req, res) => {
+  const entry = donationStore.find(d => d.id === req.params.id);
+  if (!entry) return res.status(404).json({ ok: false });
+  res.json({ ok: true, donation: entry });
 });
 
 app.get("/live-servers", (req, res) => res.json(Array.from(liveDataCache.values())));
@@ -391,7 +404,7 @@ app.post("/presence-check", async (req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`[server] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET" : "NOT SET"} | DONATION_SECRET:${DONATION_SECRET !== "changeme" ? "SET" : "USING DEFAULT"}`);
+  console.log(`[server] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET" : "NOT SET"} | UNIVERSE_ID:${DEFAULT_UNIVERSE_ID}`);
   startLiveBroadcast();
 });
 
