@@ -13,14 +13,14 @@ const MIN_CAPACITY_RATIO = parseFloat(process.env.MIN_CAPACITY_RATIO || "0.0");
 const MAX_WORKERS = parseInt(process.env.MAX_WORKERS || "12");
 const JOB_TTL_MS = 20 * 60 * 1000;
 const DONATION_SECRET = process.env.DONATION_SECRET || "phonktobiboy!";
+const MAX_DONATIONS = 200;
+const DONATION_TTL_MS = 5 * 60 * 1000;
+const SERVER_ID_TTL_MS = 30 * 1000;
 
 const jobs = new Map();
 const liveSubscribers = new Map();
 const liveDataCache = new Map();
 let liveBroadcastInterval = null;
-
-const MAX_DONATIONS = 200;
-const DONATION_TTL_MS = 20 * 1000;
 const donationStore = [];
 
 function addDonation(entry) {
@@ -46,10 +46,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function apiFetch(url, opts = {}, retries = 5) {
   for (let i = 0; i < retries; i++) {
     try {
-      const res = await fetch(url, {
-        ...opts,
-        headers: { ...robloxHeaders(), ...(opts.headers || {}) }
-      });
+      const res = await fetch(url, { ...opts, headers: { ...robloxHeaders(), ...(opts.headers || {}) } });
       if (res.status === 429) { await sleep(3500 * (i + 1)); continue; }
       return res;
     } catch (e) {
@@ -73,9 +70,7 @@ async function resolveUser(username) {
 
 async function resolveHeadshot(userId, size = "150x150") {
   try {
-    const res = await apiFetch(
-      `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=${size}&format=Png&isCircular=false`
-    );
+    const res = await apiFetch(`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=${size}&format=Png&isCircular=false`);
     const data = await res.json();
     return data?.data?.[0]?.imageUrl || "";
   } catch { return ""; }
@@ -95,12 +90,25 @@ async function getPresenceStatus(userId, placeId) {
     const inThisGame = inGame && String(p.rootPlaceId || p.placeId || "") === String(placeId || DEFAULT_PLACE_ID);
     return {
       type: p.userPresenceType === 0 ? "offline" : p.userPresenceType === 1 ? "online" : p.userPresenceType === 2 ? "ingame" : "unknown",
-      inGame,
-      inThisGame,
+      inGame, inThisGame,
       gameId: p.gameId || null,
       placeId: String(p.rootPlaceId || p.placeId || "")
     };
   } catch { return { type: "unknown", inGame: false, inThisGame: false, gameId: null }; }
+}
+
+async function checkPresenceForJoin(username) {
+  try {
+    const { userId } = await resolveUser(username);
+    if (!userId) return null;
+    const presence = await getPresenceStatus(userId, DEFAULT_PLACE_ID);
+    console.log(`[presence] ${username} inGame:${presence.inGame} inThisGame:${presence.inThisGame} gameId:${presence.gameId}`);
+    if (presence.inGame && presence.gameId && presence.inThisGame) return presence.gameId;
+    return null;
+  } catch (e) {
+    console.log(`[presence error] ${username} ${e.message}`);
+    return null;
+  }
 }
 
 async function batchMatchServer(server, targetUserId, thumbnailUrls) {
@@ -113,21 +121,16 @@ async function batchMatchServer(server, targetUserId, thumbnailUrls) {
     return { requestId, token, type: "AvatarHeadShot", size: "48x48", format: "png", isCircular: false };
   });
   try {
-    const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
-      method: "POST", headers: robloxHeaders(), body: JSON.stringify(batchRequests)
-    });
+    const res = await fetch("https://thumbnails.roblox.com/v1/batch", { method: "POST", headers: robloxHeaders(), body: JSON.stringify(batchRequests) });
     if (!res.ok) return null;
     const data = await res.json();
     for (const entry of data.data || []) {
       if (!entry || !entry.requestId) continue;
       const token = tokenMap.get(entry.requestId);
       if (!token) continue;
-      const imageUrl = entry.imageUrl;
-      if (imageUrl) {
+      if (entry.imageUrl) {
         for (const thumb of thumbnailUrls) {
-          if (thumb && imageUrl === thumb) {
-            return { serverId: server.id, matchType: "thumbnail" };
-          }
+          if (thumb && entry.imageUrl === thumb) return { serverId: server.id, matchType: "thumbnail" };
         }
       }
     }
@@ -162,9 +165,7 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
   const sortOrders = ["Asc", "Desc"];
   const limits = [100, 50];
   const maxPages = 15;
-
   const notifyQueue = () => { if (queueResolve) { const r = queueResolve; queueResolve = null; r(); } };
-
   const fetcher = async (startCursor, sortOrder, limit, workerId) => {
     let cursor = startCursor;
     let pages = 0, seen = 0;
@@ -181,7 +182,6 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
     fetchersFinished++;
     if (fetchersFinished === totalFetchers) notifyQueue();
   };
-
   const matcher = async () => {
     const batchSize = 20;
     while (!found.value && !job.cancelled) {
@@ -201,13 +201,11 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
       }
     }
   };
-
   const startCursors = await Promise.all([
     (async () => null)(),
     (async () => { try { const { nextCursor } = await fetchServersPage(placeId, "Asc", 100); return nextCursor; } catch { return null; } })(),
     (async () => { try { const { nextCursor } = await fetchServersPage(placeId, "Desc", 100); return nextCursor; } catch { return null; } })()
   ]);
-
   const workers = [];
   let workerId = 1;
   for (const sort of sortOrders) {
@@ -221,7 +219,6 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
     }
   }
   while (workers.length < totalFetchers) workers.push(fetcher(null, "Asc", 100, workerId++));
-
   await Promise.race([Promise.allSettled(workers), matcher()]);
   return found.result;
 }
@@ -234,16 +231,9 @@ async function runSearch(jobId, username, placeId, instanceCount) {
     const { userId, displayName } = await resolveUser(username);
     if (!userId) { job.status = "done"; job.result = { found: false, message: `User "${username}" does not exist` }; return; }
     job.userId = userId;
-
-    const [thumb150, thumb48, thumb720] = await Promise.all([
-      resolveHeadshot(userId, "150x150"),
-      resolveHeadshot(userId, "48x48"),
-      resolveHeadshot(userId, "720x720")
-    ]);
-
+    const [thumb150, thumb48, thumb720] = await Promise.all([resolveHeadshot(userId, "150x150"), resolveHeadshot(userId, "48x48"), resolveHeadshot(userId, "720x720")]);
     job.step = "Checking presence...";
     const presence = await getPresenceStatus(userId, placeId);
-
     if (presence.type === "offline") { job.status = "done"; job.result = { found: false, message: `${displayName} is offline`, presenceStatus: "offline" }; return; }
     if (presence.type === "online") { job.status = "done"; job.result = { found: false, message: `${displayName} is on website but not in game`, presenceStatus: "online" }; return; }
     if (presence.inGame && presence.gameId && presence.inThisGame) {
@@ -251,15 +241,11 @@ async function runSearch(jobId, username, placeId, instanceCount) {
       job.result = { found: true, serverId: presence.gameId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: 1, matchType: "presence" };
       return;
     }
-
     if (job.cancelled) return;
-
     job.step = `Deep scanning with ${instanceCount} workers...`;
     const result = await deepSnipe(job, userId, [thumb48, thumb720], placeId, instanceCount);
-
     if (job.cancelled) return;
     job.status = "done";
-
     if (result) {
       job.result = { found: true, serverId: result.serverId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: 1, matchType: result.matchType };
     } else {
@@ -301,50 +287,47 @@ function startLiveBroadcast() {
   }, 5000);
 }
 
-async function checkPresenceForJoin(username) {
-  try {
-    const { userId } = await resolveUser(username);
-    if (!userId) return null;
-    const presence = await getPresenceStatus(userId, DEFAULT_PLACE_ID);
-    if (presence.inGame && presence.gameId && presence.inThisGame) return presence.gameId;
-    return null;
-  } catch { return null; }
-}
-
 app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size, donations: donationStore.length }));
 
 app.post("/donation", async (req, res) => {
-  const { secret, donor, receiver, robux, donorHasJoin, receiverHasJoin } = req.body;
+  const { secret, donor, receiver, robux } = req.body;
   if (secret !== DONATION_SECRET) return res.status(403).json({ ok: false, message: "Forbidden" });
   if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
   const amount = parseInt(String(robux).replace(/,/g, ""), 10);
   if (isNaN(amount) || amount < 1000) return res.status(400).json({ ok: false, message: "Amount must be 1000 or above" });
-  let serverId = null;
-  if (receiverHasJoin || donorHasJoin) {
-    const presenceChecks = [];
-    if (receiverHasJoin) presenceChecks.push(checkPresenceForJoin(receiver));
-    if (donorHasJoin) presenceChecks.push(checkPresenceForJoin(donor));
-    const results = await Promise.all(presenceChecks);
-    for (const result of results) {
-      if (result) { serverId = result; break; }
-    }
-  }
+
   const entry = {
     donor: String(donor),
     receiver: String(receiver),
     robux: amount,
     id: randomUUID(),
     ts: Date.now(),
-    serverId: serverId || null
+    serverId: null
   };
+
   addDonation(entry);
-  if (serverId) {
-    setTimeout(() => {
-      const idx = donationStore.findIndex(d => d.id === entry.id);
-      if (idx !== -1) donationStore.splice(idx, 1);
-    }, 30 * 1000);
-  }
+  console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
+
   res.json({ ok: true });
+
+  if (ROBLOSECURITY) {
+    try {
+      const [donorServerId, receiverServerId] = await Promise.all([
+        checkPresenceForJoin(donor),
+        checkPresenceForJoin(receiver)
+      ]);
+      const foundServerId = donorServerId || receiverServerId;
+      if (foundServerId) {
+        entry.serverId = foundServerId;
+        console.log(`[donation] updated serverId:${foundServerId} for ${entry.id}`);
+        setTimeout(() => {
+          entry.serverId = null;
+        }, SERVER_ID_TTL_MS);
+      }
+    } catch (e) {
+      console.log(`[donation presence error] ${e.message}`);
+    }
+  }
 });
 
 app.get("/donations", (req, res) => {
@@ -361,9 +344,7 @@ app.get("/donations/latest", (req, res) => {
   res.json({ ok: true, donation: active[0] });
 });
 
-app.get("/live-servers", (req, res) => {
-  res.json(Array.from(liveDataCache.values()));
-});
+app.get("/live-servers", (req, res) => res.json(Array.from(liveDataCache.values())));
 
 app.post("/resolve", async (req, res) => {
   const { username } = req.body;
@@ -410,7 +391,7 @@ app.post("/presence-check", async (req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`[server] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET" : "NOT SET"} | DONATION_SECRET:${DONATION_SECRET !== "changeme" ? "SET" : "USING DEFAULT - CHANGE THIS"}`);
+  console.log(`[server] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET" : "NOT SET"} | DONATION_SECRET:${DONATION_SECRET !== "changeme" ? "SET" : "USING DEFAULT"}`);
   startLiveBroadcast();
 });
 
