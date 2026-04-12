@@ -77,20 +77,6 @@ async function resolveHeadshot(userId, size = "150x150") {
   } catch { return ""; }
 }
 
-async function getUniverseIdForUser(userId) {
-  if (!ROBLOSECURITY) return null;
-  try {
-    const res = await apiFetch("https://presence.roblox.com/v1/presence/users", {
-      method: "POST",
-      body: JSON.stringify({ userIds: [Number(userId)] })
-    });
-    const data = await res.json();
-    const p = data?.userPresences?.[0];
-    if (!p || p.userPresenceType !== 2) return null;
-    return { gameId: p.gameId || null, placeId: String(p.rootPlaceId || p.placeId || ""), universeId: null };
-  } catch { return null; }
-}
-
 async function getPresenceStatus(userId, placeId) {
   if (!ROBLOSECURITY) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
   try {
@@ -103,7 +89,7 @@ async function getPresenceStatus(userId, placeId) {
     if (!p) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
     const inGame = p.userPresenceType === 2;
     const userPlaceId = String(p.rootPlaceId || p.placeId || "");
-    const inThisGame = inGame && (userPlaceId === String(placeId) || p.universeId === Number(DEFAULT_UNIVERSE_ID));
+    const inThisGame = inGame && (userPlaceId === String(placeId) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID));
     return {
       type: p.userPresenceType === 0 ? "offline" : p.userPresenceType === 1 ? "online" : p.userPresenceType === 2 ? "ingame" : "unknown",
       inGame, inThisGame,
@@ -113,11 +99,10 @@ async function getPresenceStatus(userId, placeId) {
   } catch { return { type: "unknown", inGame: false, inThisGame: false, gameId: null }; }
 }
 
-async function checkPresenceForJoin(username) {
+async function checkPresenceForJoinFull(username) {
   try {
     const { userId } = await resolveUser(username);
-    if (!userId) return null;
-    if (!ROBLOSECURITY) return null;
+    if (!userId || !ROBLOSECURITY) return null;
     const res = await apiFetch("https://presence.roblox.com/v1/presence/users", {
       method: "POST",
       body: JSON.stringify({ userIds: [Number(userId)] })
@@ -127,8 +112,8 @@ async function checkPresenceForJoin(username) {
     if (!p || p.userPresenceType !== 2) return null;
     const userPlaceId = String(p.rootPlaceId || p.placeId || "");
     const inThisGame = userPlaceId === String(DEFAULT_PLACE_ID) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID);
-    console.log(`[presence] ${username} inGame:true inThisGame:${inThisGame} gameId:${p.gameId} placeId:${userPlaceId} universeId:${p.universeId}`);
-    if (inThisGame && p.gameId) return p.gameId;
+    console.log(`[presence] ${username} inThisGame:${inThisGame} gameId:${p.gameId} placeId:${userPlaceId} universeId:${p.universeId}`);
+    if (inThisGame && p.gameId) return { gameId: p.gameId, placeId: userPlaceId };
     return null;
   } catch (e) {
     console.log(`[presence error] ${username} ${e.message}`);
@@ -320,35 +305,32 @@ app.post("/donation", async (req, res) => {
   if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
   const amount = parseInt(String(robux).replace(/,/g, ""), 10);
   if (isNaN(amount) || amount < 1000) return res.status(400).json({ ok: false, message: "Amount must be 1000 or above" });
-  const entry = { donor: String(donor), receiver: String(receiver), robux: amount, id: randomUUID(), ts: Date.now(), serverId: null };
+  const entry = { donor: String(donor), receiver: String(receiver), robux: amount, id: randomUUID(), ts: Date.now(), serverId: null, placeId: null };
   addDonation(entry);
   console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
   res.json({ ok: true });
   if (ROBLOSECURITY) {
     try {
-      const [donorServerId, receiverServerId] = await Promise.all([checkPresenceForJoin(donor), checkPresenceForJoin(receiver)]);
-      const foundServerId = donorServerId || receiverServerId;
-      if (foundServerId) {
-        entry.serverId = foundServerId;
-        console.log(`[donation] serverId updated:${foundServerId} for ${entry.id}`);
-        setTimeout(() => { entry.serverId = null; }, SERVER_ID_TTL_MS);
+      const [donorResult, receiverResult] = await Promise.all([checkPresenceForJoinFull(donor), checkPresenceForJoinFull(receiver)]);
+      const found = donorResult || receiverResult;
+      if (found) {
+        entry.serverId = found.gameId;
+        entry.placeId = found.placeId;
+        console.log(`[donation] serverId:${found.gameId} placeId:${found.placeId} for ${entry.id}`);
+        setTimeout(() => { entry.serverId = null; entry.placeId = null; }, SERVER_ID_TTL_MS);
       }
     } catch (e) { console.log(`[donation presence error] ${e.message}`); }
   }
 });
 
 app.get("/donations", (req, res) => {
-  const now = Date.now();
-  const active = donationStore.filter(d => (now - d.ts) < DONATION_TTL_MS);
   const limit = Math.min(parseInt(req.query.limit || "50", 10), MAX_DONATIONS);
-  res.json({ ok: true, count: Math.min(limit, active.length), donations: active.slice(0, limit) });
+  res.json({ ok: true, count: Math.min(limit, donationStore.length), donations: donationStore.slice(0, limit) });
 });
 
 app.get("/donations/latest", (req, res) => {
-  const now = Date.now();
-  const active = donationStore.filter(d => (now - d.ts) < DONATION_TTL_MS);
-  if (!active.length) return res.json({ ok: true, donation: null });
-  res.json({ ok: true, donation: active[0] });
+  if (!donationStore.length) return res.json({ ok: true, donation: null });
+  res.json({ ok: true, donation: donationStore[0] });
 });
 
 app.get("/donation/:id", (req, res) => {
@@ -407,6 +389,8 @@ const server = app.listen(PORT, () => {
   console.log(`[server] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET" : "NOT SET"} | UNIVERSE_ID:${DEFAULT_UNIVERSE_ID}`);
   startLiveBroadcast();
 });
+
+setInterval(() => { fetch(`http://localhost:${PORT}/`).catch(() => {}); }, 14 * 60 * 1000);
 
 const wss = new WebSocket.Server({ server, path: "/live" });
 wss.on("connection", (ws) => {
