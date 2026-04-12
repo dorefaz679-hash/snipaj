@@ -305,7 +305,7 @@ app.post("/donation", async (req, res) => {
   if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
   const amount = parseInt(String(robux).replace(/,/g, ""), 10);
   if (isNaN(amount) || amount < 1000) return res.status(400).json({ ok: false, message: "Amount must be 1000 or above" });
-  const entry = { donor: String(donor), receiver: String(receiver), robux: amount, id: randomUUID(), ts: Date.now(), serverId: null, placeId: null };
+  const entry = { donor: String(donor), receiver: String(receiver), robux: amount, id: randomUUID(), ts: Date.now(), serverId: null, placeId: null, joinTarget: null };
   addDonation(entry);
   console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
   res.json({ ok: true });
@@ -313,11 +313,13 @@ app.post("/donation", async (req, res) => {
     try {
       const [donorResult, receiverResult] = await Promise.all([checkPresenceForJoinFull(donor), checkPresenceForJoinFull(receiver)]);
       const found = donorResult || receiverResult;
-      if (found) {
+      const target = donorResult ? donor : receiverResult ? receiver : null;
+      if (found && target) {
         entry.serverId = found.gameId;
         entry.placeId = found.placeId;
-        console.log(`[donation] serverId:${found.gameId} placeId:${found.placeId} for ${entry.id}`);
-        setTimeout(() => { entry.serverId = null; entry.placeId = null; }, SERVER_ID_TTL_MS);
+        entry.joinTarget = target;
+        console.log(`[donation] serverId:${found.gameId} joinTarget:${target} for ${entry.id}`);
+        setTimeout(() => { entry.serverId = null; entry.placeId = null; entry.joinTarget = null; }, SERVER_ID_TTL_MS);
       }
     } catch (e) { console.log(`[donation presence error] ${e.message}`); }
   }
