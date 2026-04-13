@@ -21,6 +21,7 @@ const SERVER_CAPACITY_TTL_MS = 60 * 1000;
 const PRESENCE_CACHE_TTL_MS = 15 * 1000;
 const ENRICHMENT_RETRIES = 5;
 const ENRICHMENT_RETRY_BASE_DELAY = 1200;
+const AUTH_KEY_TTL_MS = 30 * 1000;
 
 const jobs = new Map();
 const liveSubscribers = new Map();
@@ -32,6 +33,9 @@ const donationSubscribers = new Map();
 const presenceCache = new Map();
 const pendingEnrichment = new Map();
 const enrichmentInFlight = new Set();
+
+const authKeys = new Map();
+const subscriptionSockets = new Map();
 
 function setServerCapacity(serverId, playing, maxPlayers) {
   serverCapacityCache.set(serverId, { playing, maxPlayers, ts: Date.now() });
@@ -447,6 +451,33 @@ function startLiveBroadcast() {
   }, 5000);
 }
 
+function buildLiveChannelData() {
+  const result = {};
+  for (const [serverId, cached] of liveDataCache.entries()) {
+    const donation = donationStore.find(d => d.serverId === serverId);
+    const base = {
+      serverId,
+      placeId: DEFAULT_PLACE_ID,
+      placename: donation ? `PLS DONATE 💸 ${donation.donor} → ${donation.receiver}` : "PLS DONATE 💸",
+      players: `${cached.playing}/${cached.maxPlayers}`,
+      fps: "60",
+      ping: "25",
+      Robux: donation ? donation.robux : "?",
+      Donator: donation ? donation.donor : "",
+      Receiver: donation ? donation.receiver : "",
+      Donatorimg: "",
+      Receiverimg: "",
+      Timestamp: Date.now()
+    };
+    if (donation) {
+      base.Donatorimg = `https://www.roblox.com/headshot-thumbnail/image?userId=${donation.donorId || 0}&width=48&height=48&format=png`;
+      base.Receiverimg = `https://www.roblox.com/headshot-thumbnail/image?userId=${donation.receiverId || 0}&width=48&height=48&format=png`;
+    }
+    result[serverId] = base;
+  }
+  return result;
+}
+
 async function enrichDonationWithRetries(entry, targetUsername) {
   if (enrichmentInFlight.has(entry.id)) return;
   enrichmentInFlight.add(entry.id);
@@ -489,6 +520,11 @@ async function processPendingEnrichments() {
 setInterval(processPendingEnrichments, 2000);
 
 app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size, donations: donationStore.length }));
+
+app.get("/api/livechannelstatus", (req, res) => {
+  const count = liveDataCache.size;
+  res.json({ ok: true, count, status: count > 0 ? 200 : 204 });
+});
 
 app.post("/donation", async (req, res) => {
   const { secret, donor, receiver, robux } = req.body;
@@ -614,6 +650,23 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
+  if (path === "/livechannel") {
+    const authkey = url.searchParams.get("authkey");
+    if (!authkey || !authKeys.has(authkey)) {
+      ws.close(1008, "Unauthorized");
+      return;
+    }
+    const auth = authKeys.get(authkey);
+    auth.ts = Date.now();
+    const id = randomUUID();
+    liveSubscribers.set(id, ws);
+    const data = buildLiveChannelData();
+    if (Object.keys(data).length) ws.send(JSON.stringify(data));
+    ws.on("close", () => liveSubscribers.delete(id));
+    ws.on("error", () => liveSubscribers.delete(id));
+    return;
+  }
+
   if (path === "/donations/live") {
     const id = randomUUID();
     donationSubscribers.set(id, ws);
@@ -621,6 +674,30 @@ wss.on("connection", (ws, req) => {
     if (recent.length) ws.send(JSON.stringify({ type: "history", donations: recent }));
     ws.on("close", () => donationSubscribers.delete(id));
     ws.on("error", () => donationSubscribers.delete(id));
+    return;
+  }
+
+  if (path === "/api/subscriptionstatus") {
+    ws.on("message", (raw) => {
+      try {
+        const msg = JSON.parse(raw);
+        if (msg.DiscordID) {
+          const authkey = randomUUID();
+          const expiry = Math.floor(Date.now() / 1000) + 86400;
+          authKeys.set(authkey, { discord: msg.DiscordID, instances: msg.Instances || 1, ts: Date.now(), expiry });
+          subscriptionSockets.set(msg.DiscordID, ws);
+          ws.send(JSON.stringify({ expiry, ws_key: authkey, ip: req.socket.remoteAddress, sharing: false }));
+          setTimeout(() => {
+            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ expiry: Math.floor(Date.now() / 1000) + 86400 }));
+          }, 30000);
+        }
+      } catch {}
+    });
+    ws.on("close", () => {
+      for (const [discord, sock] of subscriptionSockets.entries()) {
+        if (sock === ws) subscriptionSockets.delete(discord);
+      }
+    });
     return;
   }
 
@@ -647,3 +724,18 @@ wss.on("connection", (ws, req) => {
 
   ws.close();
 });
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, data] of authKeys.entries()) {
+    if (now - data.ts > AUTH_KEY_TTL_MS) authKeys.delete(key);
+  }
+}, 5000);
+
+setInterval(() => {
+  const liveChannelData = buildLiveChannelData();
+  const payload = JSON.stringify(liveChannelData);
+  for (const ws of liveSubscribers.values()) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+  }
+}, 2000);
