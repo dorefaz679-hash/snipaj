@@ -18,6 +18,9 @@ const MAX_DONATIONS = 200;
 const DONATION_TTL_MS = 5 * 60 * 1000;
 const SERVER_ID_TTL_MS = 30 * 1000;
 const SERVER_CAPACITY_TTL_MS = 60 * 1000;
+const PRESENCE_CACHE_TTL_MS = 15 * 1000;
+const ENRICHMENT_RETRIES = 5;
+const ENRICHMENT_RETRY_BASE_DELAY = 1200;
 
 const jobs = new Map();
 const liveSubscribers = new Map();
@@ -26,6 +29,8 @@ const serverCapacityCache = new Map();
 let liveBroadcastInterval = null;
 const donationStore = [];
 const donationSubscribers = new Map();
+const presenceCache = new Map();
+const pendingEnrichment = new Map();
 
 function setServerCapacity(serverId, playing, maxPlayers) {
   serverCapacityCache.set(serverId, { playing, maxPlayers, ts: Date.now() });
@@ -53,6 +58,33 @@ function addDonation(entry) {
     const idx = donationStore.findIndex(d => d.id === entry.id);
     if (idx !== -1) donationStore.splice(idx, 1);
   }, DONATION_TTL_MS);
+}
+
+function updateDonationWithServer(entry, gameId, placeId, targetUsername) {
+  entry.serverId = gameId;
+  entry.placeId = placeId;
+  entry.joinTarget = targetUsername;
+  
+  const cap = serverCapacityCache.get(gameId);
+  if (cap) {
+    entry.serverPlaying = cap.playing;
+    entry.serverMaxPlayers = cap.maxPlayers;
+    entry.serverFull = cap.maxPlayers > 0 && cap.playing >= cap.maxPlayers;
+  }
+  
+  console.log(`[donation] serverId:${gameId} joinTarget:${targetUsername} for ${entry.id}`);
+  
+  const updatedPayload = JSON.stringify({ type: "donation_update", donation: entry });
+  for (const ws of donationSubscribers.values()) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(updatedPayload);
+  }
+  
+  setTimeout(() => {
+    entry.serverId = null;
+    entry.placeId = null;
+    entry.joinTarget = null;
+    entry.serverFull = false;
+  }, SERVER_ID_TTL_MS);
 }
 
 function robloxHeaders() {
@@ -112,7 +144,6 @@ async function getPresenceStatus(userId, placeId) {
     const inGame = p.userPresenceType === 2;
     const userPlaceId = String(p.rootPlaceId || p.placeId || "");
     const inThisGame = inGame && (userPlaceId === String(placeId) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID));
-    console.log(`[presence] ${userId} inThisGame:${inThisGame} gameId:${p.gameId||null} placeId:${userPlaceId} universeId:${p.universeId||null}`);
     return {
       type: p.userPresenceType === 0 ? "offline" : p.userPresenceType === 1 ? "online" : p.userPresenceType === 2 ? "ingame" : "unknown",
       inGame, inThisGame,
@@ -126,17 +157,28 @@ async function checkPresenceForJoinFull(username) {
   try {
     const { userId } = await resolveUser(username);
     if (!userId || !ROBLOSECURITY) return null;
+    
+    const cacheKey = `presence:${userId}`;
+    const cached = presenceCache.get(cacheKey);
+    if (cached && (Date.now() - cached.ts) < PRESENCE_CACHE_TTL_MS) {
+      return cached.data;
+    }
+    
     const res = await apiFetch("https://presence.roblox.com/v1/presence/users", {
       method: "POST",
       body: JSON.stringify({ userIds: [Number(userId)] })
     });
     const data = await res.json();
     const p = data?.userPresences?.[0];
-    if (!p || p.userPresenceType !== 2) return null;
+    if (!p || p.userPresenceType !== 2) {
+      presenceCache.set(cacheKey, { data: null, ts: Date.now() });
+      return null;
+    }
     const userPlaceId = String(p.rootPlaceId || p.placeId || "");
     const inThisGame = userPlaceId === String(DEFAULT_PLACE_ID) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID);
-    if (inThisGame && p.gameId) return { gameId: p.gameId, placeId: userPlaceId };
-    return null;
+    const result = (inThisGame && p.gameId) ? { gameId: p.gameId, placeId: userPlaceId } : null;
+    presenceCache.set(cacheKey, { data: result, ts: Date.now() });
+    return result;
   } catch { return null; }
 }
 
@@ -300,7 +342,6 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
     send({ status: "update", msg: "Checking presence..." });
 
     const presence = await getPresenceStatus(userId, placeId);
-    console.log(`[sniper] ${username} presence:${presence.type} inThisGame:${presence.inThisGame} gameId:${presence.gameId||null}`);
     if (presence.type === "offline") {
       send({ status: "done", result: "not_found", msg: `${displayName} is offline` });
       return;
@@ -343,7 +384,6 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
       if (result.playing != null && result.maxPlayers != null) {
         setServerCapacity(result.serverId, result.playing, result.maxPlayers);
       }
-      console.log(`[sniper] FOUND ${username} serverId:${result.serverId} matchType:${result.matchType}`);
       send({
         status: "done",
         result: "found",
@@ -362,7 +402,6 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
     } else {
       const finalPresence = await getPresenceStatus(userId, placeId);
       const privateGuess = finalPresence.inGame && finalPresence.inThisGame;
-      console.log(`[sniper] NOT FOUND ${username} possiblePrivate:${privateGuess}`);
       send({
         status: "done",
         result: "not_found",
@@ -405,6 +444,35 @@ function startLiveBroadcast() {
   }, 5000);
 }
 
+async function enrichDonationWithRetries(entry, targetUsername) {
+  for (let attempt = 0; attempt < ENRICHMENT_RETRIES; attempt++) {
+    const found = await checkPresenceForJoinFull(targetUsername);
+    if (found) {
+      updateDonationWithServer(entry, found.gameId, found.placeId, targetUsername);
+      pendingEnrichment.delete(entry.id);
+      return;
+    }
+    if (attempt < ENRICHMENT_RETRIES - 1) {
+      await sleep(ENRICHMENT_RETRY_BASE_DELAY * Math.pow(2, attempt));
+    }
+  }
+  console.log(`[donation] enrichment failed for ${entry.id} after ${ENRICHMENT_RETRIES} attempts`);
+  pendingEnrichment.delete(entry.id);
+}
+
+async function processPendingEnrichments() {
+  const entries = Array.from(pendingEnrichment.values());
+  const batches = [];
+  for (let i = 0; i < entries.length; i += 10) {
+    batches.push(entries.slice(i, i + 10));
+  }
+  for (const batch of batches) {
+    await Promise.allSettled(batch.map(({ entry, target }) => enrichDonationWithRetries(entry, target)));
+  }
+}
+
+setInterval(processPendingEnrichments, 2000);
+
 app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size, donations: donationStore.length }));
 
 app.post("/donation", async (req, res) => {
@@ -413,40 +481,28 @@ app.post("/donation", async (req, res) => {
   if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
   const amount = parseInt(String(robux).replace(/,/g, ""), 10);
   if (isNaN(amount) || amount < 1000) return res.status(400).json({ ok: false, message: "Amount must be 1000 or above" });
+  
   const entry = { donor: String(donor), receiver: String(receiver), robux: amount, id: randomUUID(), ts: Date.now(), serverId: null, placeId: null, joinTarget: null, serverFull: false, serverPlaying: null, serverMaxPlayers: null };
   addDonation(entry);
   res.json({ ok: true });
+  
   if (ROBLOSECURITY) {
-    try {
-      const [donorResult, receiverResult] = await Promise.all([checkPresenceForJoinFull(donor), checkPresenceForJoinFull(receiver)]);
-      const found = donorResult || receiverResult;
-      const target = donorResult ? donor : receiverResult ? receiver : null;
-      if (found && target) {
-        entry.serverId = found.gameId;
-        entry.placeId = found.placeId;
-        entry.joinTarget = target;
-        console.log(`[donation] serverId:${entry.serverId} joinTarget:${entry.joinTarget} for ${entry.id}`);
-        const cap = serverCapacityCache.get(found.gameId);
-        if (cap) {
-          entry.serverPlaying = cap.playing;
-          entry.serverMaxPlayers = cap.maxPlayers;
-          entry.serverFull = cap.maxPlayers > 0 && cap.playing >= cap.maxPlayers;
-        } else {
-          await refreshServerCapacity(found.gameId);
-          const cap2 = serverCapacityCache.get(found.gameId);
-          if (cap2) {
-            entry.serverPlaying = cap2.playing;
-            entry.serverMaxPlayers = cap2.maxPlayers;
-            entry.serverFull = cap2.maxPlayers > 0 && cap2.playing >= cap2.maxPlayers;
-          }
-        }
-        const updatedPayload = JSON.stringify({ type: "donation_update", donation: entry });
-        for (const ws of donationSubscribers.values()) {
-          if (ws.readyState === WebSocket.OPEN) ws.send(updatedPayload);
-        }
-        setTimeout(() => { entry.serverId = null; entry.placeId = null; entry.joinTarget = null; entry.serverFull = false; }, SERVER_ID_TTL_MS);
-      }
-    } catch {}
+    const donorCheck = checkPresenceForJoinFull(donor);
+    const receiverCheck = checkPresenceForJoinFull(receiver);
+    const results = await Promise.allSettled([donorCheck, receiverCheck]);
+    
+    const donorResult = results[0].status === 'fulfilled' ? results[0].value : null;
+    const receiverResult = results[1].status === 'fulfilled' ? results[1].value : null;
+    
+    const found = donorResult || receiverResult;
+    const target = donorResult ? donor : receiverResult ? receiver : null;
+    
+    if (found && target) {
+      updateDonationWithServer(entry, found.gameId, found.placeId, target);
+    } else {
+      const targetForRetry = donorResult ? donor : receiver;
+      pendingEnrichment.set(entry.id, { entry, target: targetForRetry, addedAt: Date.now() });
+    }
   }
 });
 
