@@ -10,6 +10,13 @@ const PORT = process.env.PORT || 3000;
 const ROBLOSECURITY = process.env.ROBLOSECURITY || "";
 const DEFAULT_UNIVERSE_ID = process.env.UNIVERSE_ID || "3317679266";
 const DEFAULT_PLACE_ID = process.env.PLACE_ID || "8737602449";
+const ALL_PLACE_IDS = [
+  "8737602449",
+  "8943844393",
+  "8943846005",
+  "15611066348",
+  "130598004097945"
+];
 const MIN_CAPACITY_RATIO = parseFloat(process.env.MIN_CAPACITY_RATIO || "0.0");
 const MAX_WORKERS = parseInt(process.env.MAX_WORKERS || "12");
 const JOB_TTL_MS = 20 * 60 * 1000;
@@ -150,7 +157,7 @@ async function getPresenceStatus(userId, placeId) {
     if (!p) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
     const inGame = p.userPresenceType === 2;
     const userPlaceId = String(p.rootPlaceId || p.placeId || "");
-    const inThisGame = inGame && (userPlaceId === String(placeId) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID));
+    const inThisGame = inGame && (ALL_PLACE_IDS.includes(userPlaceId) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID));
     return {
       type: p.userPresenceType === 0 ? "offline" : p.userPresenceType === 1 ? "online" : p.userPresenceType === 2 ? "ingame" : "unknown",
       inGame, inThisGame,
@@ -182,7 +189,7 @@ async function checkPresenceForJoinFull(username) {
       return null;
     }
     const userPlaceId = String(p.rootPlaceId || p.placeId || "");
-    const inThisGame = userPlaceId === String(DEFAULT_PLACE_ID) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID);
+    const inThisGame = ALL_PLACE_IDS.includes(userPlaceId) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID);
     const result = (inThisGame && p.gameId) ? { gameId: p.gameId, placeId: userPlaceId } : null;
     presenceCache.set(cacheKey, { data: result, ts: Date.now() });
     return result;
@@ -191,17 +198,19 @@ async function checkPresenceForJoinFull(username) {
 
 async function refreshServerCapacity(serverId) {
   try {
-    const url = new URL(`https://games.roblox.com/v1/games/${DEFAULT_PLACE_ID}/servers/Public`);
-    url.searchParams.set("sortOrder", "Asc");
-    url.searchParams.set("limit", "100");
-    const res = await apiFetch(url.toString());
-    if (!res.ok) return;
-    const data = await res.json();
-    for (const s of data.data || []) {
-      if (s.id && s.maxPlayers != null) {
-        setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+    const results = await Promise.allSettled(ALL_PLACE_IDS.map(async (pid) => {
+      const url = new URL(`https://games.roblox.com/v1/games/${pid}/servers/Public`);
+      url.searchParams.set("sortOrder", "Asc");
+      url.searchParams.set("limit", "100");
+      const res = await apiFetch(url.toString());
+      if (!res.ok) return;
+      const data = await res.json();
+      for (const s of data.data || []) {
+        if (s.id && s.maxPlayers != null) {
+          setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+        }
       }
-    }
+    }));
   } catch {}
 }
 
@@ -227,7 +236,7 @@ async function batchMatchServer(server, targetUserId, thumbnailUrls) {
       if (!token) continue;
       if (entry.imageUrl) {
         for (const thumb of thumbnailUrls) {
-          if (thumb && entry.imageUrl === thumb) return { serverId: server.id, matchType: "thumbnail", playing: server.playing, maxPlayers: server.maxPlayers };
+          if (thumb && entry.imageUrl === thumb) return { serverId: server.id, matchType: "thumbnail", playing: server.playing, maxPlayers: server.maxPlayers, placeId: server._placeId };
         }
       }
     }
@@ -247,7 +256,7 @@ async function fetchServersPage(placeId, sortOrder, limit, cursor = null) {
     if (!s.playerTokens?.length) return false;
     if (!s.maxPlayers) return true;
     return (s.playing / s.maxPlayers) >= MIN_CAPACITY_RATIO;
-  });
+  }).map(s => ({ ...s, _placeId: String(placeId) }));
   for (const s of servers) {
     if (s.id && s.maxPlayers != null) {
       setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
@@ -256,7 +265,24 @@ async function fetchServersPage(placeId, sortOrder, limit, cursor = null) {
   return { servers, nextCursor: data.nextPageCursor || null };
 }
 
+async function fetchServersPageAllPlaces(sortOrder, limit, cursors = {}) {
+  const results = await Promise.allSettled(
+    ALL_PLACE_IDS.map(pid => fetchServersPage(pid, sortOrder, limit, cursors[pid] || null))
+  );
+  const servers = [];
+  const nextCursors = {};
+  results.forEach((r, i) => {
+    const pid = ALL_PLACE_IDS[i];
+    if (r.status === "fulfilled") {
+      servers.push(...r.value.servers);
+      if (r.value.nextCursor) nextCursors[pid] = r.value.nextCursor;
+    }
+  });
+  return { servers, nextCursors };
+}
+
 async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onStep) {
+  const targetPlaceIds = placeId && placeId !== DEFAULT_PLACE_ID ? [String(placeId)] : ALL_PLACE_IDS;
   const found = { value: false, result: null };
   const serverQueue = [];
   let queueResolve = null;
@@ -266,12 +292,13 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onSte
   const limits = [100, 50];
   const maxPages = 15;
   const notifyQueue = () => { if (queueResolve) { const r = queueResolve; queueResolve = null; r(); } };
-  const fetcher = async (startCursor, sortOrder, limit, workerId) => {
+
+  const fetcher = async (startCursor, sortOrder, limit, targetPid, workerId) => {
     let cursor = startCursor;
     let pages = 0, seen = 0;
     while (!found.value && !job.cancelled && pages < maxPages) {
       try {
-        const { servers, nextCursor } = await fetchServersPage(placeId, sortOrder, limit, cursor);
+        const { servers, nextCursor } = await fetchServersPage(targetPid, sortOrder, limit, cursor);
         seen += servers.length; pages++;
         const step = `Scanning servers... (${seen} checked)`;
         if (onStep) onStep(step);
@@ -284,6 +311,7 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onSte
     fetchersFinished++;
     if (fetchersFinished === totalFetchers) notifyQueue();
   };
+
   const matcher = async () => {
     const batchSize = 20;
     while (!found.value && !job.cancelled) {
@@ -303,24 +331,27 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onSte
       }
     }
   };
-  const startCursors = await Promise.all([
-    (async () => null)(),
-    (async () => { try { const { nextCursor } = await fetchServersPage(placeId, "Asc", 100); return nextCursor; } catch { return null; } })(),
-    (async () => { try { const { nextCursor } = await fetchServersPage(placeId, "Desc", 100); return nextCursor; } catch { return null; } })()
-  ]);
+
+  const perPlace = Math.max(1, Math.floor(totalFetchers / targetPlaceIds.length));
   const workers = [];
   let workerId = 1;
-  for (const sort of sortOrders) {
-    for (const limit of limits) {
-      const perCombo = Math.max(1, Math.floor(workerCount / (sortOrders.length * limits.length)));
-      for (let i = 0; i < perCombo; i++) {
-        const cursor = startCursors[workers.length % startCursors.length];
-        workers.push(fetcher(cursor, sort, limit, workerId++));
-        if (workers.length >= totalFetchers) break;
+
+  for (const pid of targetPlaceIds) {
+    for (const sort of sortOrders) {
+      for (const limit of limits) {
+        const perCombo = Math.max(1, Math.floor(perPlace / (sortOrders.length * limits.length)));
+        for (let i = 0; i < perCombo; i++) {
+          if (workers.length >= totalFetchers) break;
+          workers.push(fetcher(null, sort, limit, pid, workerId++));
+        }
       }
     }
   }
-  while (workers.length < totalFetchers) workers.push(fetcher(null, "Asc", 100, workerId++));
+  while (workers.length < totalFetchers) {
+    const pid = targetPlaceIds[workers.length % targetPlaceIds.length];
+    workers.push(fetcher(null, "Asc", 100, pid, workerId++));
+  }
+
   await Promise.race([Promise.allSettled(workers), matcher()]);
   return found.result;
 }
@@ -359,12 +390,13 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
     }
     if (presence.inGame && presence.gameId && presence.inThisGame) {
       const cap = serverCapacityCache.get(presence.gameId);
+      const foundPlaceId = presence.placeId || String(placeId);
       send({
         status: "done",
         result: "found",
         data: {
           serverId: presence.gameId,
-          placeId: String(placeId),
+          placeId: foundPlaceId,
           userId: String(userId),
           displayName,
           thumbnailUrl: thumb150,
@@ -378,7 +410,7 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
     }
 
     if (job.cancelled) return;
-    send({ status: "update", msg: `Deep scanning with ${instanceCount} workers...` });
+    send({ status: "update", msg: `Deep scanning ${ALL_PLACE_IDS.length} places with ${instanceCount} workers...` });
 
     const onStep = (msg) => {
       if (!job.cancelled) send({ status: "update", msg });
@@ -396,7 +428,7 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
         result: "found",
         data: {
           serverId: result.serverId,
-          placeId: String(placeId),
+          placeId: result.placeId || String(placeId),
           userId: String(userId),
           displayName,
           thumbnailUrl: thumb150,
@@ -428,9 +460,16 @@ function startLiveBroadcast() {
   liveBroadcastInterval = setInterval(async () => {
     if (liveSubscribers.size === 0) return;
     try {
-      const { servers } = await fetchServersPage(DEFAULT_PLACE_ID, "Desc", 100);
+      const allServers = [];
+      await Promise.allSettled(ALL_PLACE_IDS.map(async (pid) => {
+        const { servers } = await fetchServersPage(pid, "Desc", 100);
+        allServers.push(...servers);
+      }));
+
+      allServers.sort((a, b) => (b.playing || 0) - (a.playing || 0));
+
       const enriched = [];
-      for (const s of servers.slice(0, 30)) {
+      for (const s of allServers.slice(0, 30)) {
         const tokens = s.playerTokens.slice(0, 10);
         if (!tokens.length) continue;
         if (s.id && s.maxPlayers != null) setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
@@ -440,7 +479,7 @@ function startLiveBroadcast() {
           const data = await res.json();
           const thumbs = {};
           for (const e of data.data || []) { if (e.token) thumbs[e.token] = e.imageUrl; }
-          enriched.push({ id: s.id, playing: s.playing, maxPlayers: s.maxPlayers, playerTokens: s.playerTokens, thumbnails: thumbs, isFull: s.maxPlayers > 0 && s.playing >= s.maxPlayers });
+          enriched.push({ id: s.id, playing: s.playing, maxPlayers: s.maxPlayers, playerTokens: s.playerTokens, thumbnails: thumbs, isFull: s.maxPlayers > 0 && s.playing >= s.maxPlayers, placeId: s._placeId });
         } catch {}
       }
       liveDataCache.clear();
@@ -457,7 +496,7 @@ function buildLiveChannelData() {
     const donation = donationStore.find(d => d.serverId === serverId);
     const base = {
       serverId,
-      placeId: DEFAULT_PLACE_ID,
+      placeId: cached.placeId || DEFAULT_PLACE_ID,
       placename: donation ? `PLS DONATE 💸 ${donation.donor} → ${donation.receiver}` : "PLS DONATE 💸",
       players: `${cached.playing}/${cached.maxPlayers}`,
       fps: "60",
