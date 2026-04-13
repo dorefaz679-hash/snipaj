@@ -17,12 +17,26 @@ const DONATION_SECRET = process.env.DONATION_SECRET || "phonktobiboy!";
 const MAX_DONATIONS = 200;
 const DONATION_TTL_MS = 5 * 60 * 1000;
 const SERVER_ID_TTL_MS = 30 * 1000;
+const SERVER_CAPACITY_TTL_MS = 60 * 1000;
 
 const jobs = new Map();
 const liveSubscribers = new Map();
 const liveDataCache = new Map();
+const serverCapacityCache = new Map();
 let liveBroadcastInterval = null;
 const donationStore = [];
+
+function setServerCapacity(serverId, playing, maxPlayers) {
+  serverCapacityCache.set(serverId, { playing, maxPlayers, ts: Date.now() });
+  setTimeout(() => serverCapacityCache.delete(serverId), SERVER_CAPACITY_TTL_MS);
+}
+
+function isServerFull(serverId) {
+  const cap = serverCapacityCache.get(serverId);
+  if (!cap) return false;
+  if (!cap.maxPlayers || cap.maxPlayers === 0) return false;
+  return cap.playing >= cap.maxPlayers;
+}
 
 function addDonation(entry) {
   donationStore.unshift(entry);
@@ -112,17 +126,41 @@ async function checkPresenceForJoinFull(username) {
     if (!p || p.userPresenceType !== 2) return null;
     const userPlaceId = String(p.rootPlaceId || p.placeId || "");
     const inThisGame = userPlaceId === String(DEFAULT_PLACE_ID) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID);
-    console.log(`[presence] ${username} inThisGame:${inThisGame} gameId:${p.gameId} placeId:${userPlaceId} universeId:${p.universeId}`);
     if (inThisGame && p.gameId) return { gameId: p.gameId, placeId: userPlaceId };
     return null;
-  } catch (e) {
-    console.log(`[presence error] ${username} ${e.message}`);
-    return null;
-  }
+  } catch { return null; }
+}
+
+async function fetchServerCapacity(serverId) {
+  try {
+    const res = await apiFetch(`https://games.roblox.com/v1/games/multiget-place-details?placeIds=${DEFAULT_PLACE_ID}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.[0] || null;
+  } catch { return null; }
+}
+
+async function refreshServerCapacity(serverId) {
+  try {
+    const url = new URL(`https://games.roblox.com/v1/games/${DEFAULT_PLACE_ID}/servers/Public`);
+    url.searchParams.set("sortOrder", "Asc");
+    url.searchParams.set("limit", "100");
+    const res = await apiFetch(url.toString());
+    if (!res.ok) return;
+    const data = await res.json();
+    for (const s of data.data || []) {
+      if (s.id && s.maxPlayers != null) {
+        setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+      }
+    }
+  } catch {}
 }
 
 async function batchMatchServer(server, targetUserId, thumbnailUrls) {
   if (!server.playerTokens?.length) return null;
+  if (server.maxPlayers != null) {
+    setServerCapacity(server.id, server.playing || 0, server.maxPlayers);
+  }
   const tokens = server.playerTokens.slice(0, 100);
   const tokenMap = new Map();
   const batchRequests = tokens.map((token, idx) => {
@@ -140,7 +178,7 @@ async function batchMatchServer(server, targetUserId, thumbnailUrls) {
       if (!token) continue;
       if (entry.imageUrl) {
         for (const thumb of thumbnailUrls) {
-          if (thumb && entry.imageUrl === thumb) return { serverId: server.id, matchType: "thumbnail" };
+          if (thumb && entry.imageUrl === thumb) return { serverId: server.id, matchType: "thumbnail", playing: server.playing, maxPlayers: server.maxPlayers };
         }
       }
     }
@@ -156,14 +194,17 @@ async function fetchServersPage(placeId, sortOrder, limit, cursor = null) {
   const res = await apiFetch(url.toString());
   if (!res.ok) return { servers: [], nextCursor: null };
   const data = await res.json();
-  return {
-    servers: (data.data || []).filter(s => {
-      if (!s.playerTokens?.length) return false;
-      if (!s.maxPlayers) return true;
-      return (s.playing / s.maxPlayers) >= MIN_CAPACITY_RATIO;
-    }),
-    nextCursor: data.nextPageCursor || null
-  };
+  const servers = (data.data || []).filter(s => {
+    if (!s.playerTokens?.length) return false;
+    if (!s.maxPlayers) return true;
+    return (s.playing / s.maxPlayers) >= MIN_CAPACITY_RATIO;
+  });
+  for (const s of servers) {
+    if (s.id && s.maxPlayers != null) {
+      setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+    }
+  }
+  return { servers, nextCursor: data.nextPageCursor || null };
 }
 
 async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
@@ -247,8 +288,23 @@ async function runSearch(jobId, username, placeId, instanceCount) {
     if (presence.type === "offline") { job.status = "done"; job.result = { found: false, message: `${displayName} is offline`, presenceStatus: "offline" }; return; }
     if (presence.type === "online") { job.status = "done"; job.result = { found: false, message: `${displayName} is on website but not in game`, presenceStatus: "online" }; return; }
     if (presence.inGame && presence.gameId && presence.inThisGame) {
+      const playing = 0;
+      const maxPlayers = 0;
+      const cap = serverCapacityCache.get(presence.gameId);
       job.status = "done";
-      job.result = { found: true, serverId: presence.gameId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: 1, matchType: "presence" };
+      job.result = {
+        found: true,
+        serverId: presence.gameId,
+        placeId: String(placeId),
+        userId: String(userId),
+        displayName,
+        thumbnailUrl: thumb150,
+        foundInInstance: 1,
+        matchType: "presence",
+        serverPlaying: cap ? cap.playing : null,
+        serverMaxPlayers: cap ? cap.maxPlayers : null,
+        serverFull: cap ? isServerFull(presence.gameId) : false
+      };
       return;
     }
     if (job.cancelled) return;
@@ -257,7 +313,22 @@ async function runSearch(jobId, username, placeId, instanceCount) {
     if (job.cancelled) return;
     job.status = "done";
     if (result) {
-      job.result = { found: true, serverId: result.serverId, placeId: String(placeId), userId: String(userId), displayName, thumbnailUrl: thumb150, foundInInstance: 1, matchType: result.matchType };
+      if (result.playing != null && result.maxPlayers != null) {
+        setServerCapacity(result.serverId, result.playing, result.maxPlayers);
+      }
+      job.result = {
+        found: true,
+        serverId: result.serverId,
+        placeId: String(placeId),
+        userId: String(userId),
+        displayName,
+        thumbnailUrl: thumb150,
+        foundInInstance: 1,
+        matchType: result.matchType,
+        serverPlaying: result.playing ?? null,
+        serverMaxPlayers: result.maxPlayers ?? null,
+        serverFull: isServerFull(result.serverId)
+      };
     } else {
       const finalPresence = await getPresenceStatus(userId, placeId);
       const privateGuess = finalPresence.inGame && finalPresence.inThisGame;
@@ -280,13 +351,14 @@ function startLiveBroadcast() {
       for (const s of servers.slice(0, 30)) {
         const tokens = s.playerTokens.slice(0, 10);
         if (!tokens.length) continue;
+        if (s.id && s.maxPlayers != null) setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
         const batchRequests = tokens.map(t => ({ requestId: `0:${t}:AvatarHeadShot:48x48:png:regular`, token: t, type: "AvatarHeadShot", size: "48x48", format: "png", isCircular: false }));
         try {
           const res = await fetch("https://thumbnails.roblox.com/v1/batch", { method: "POST", headers: robloxHeaders(), body: JSON.stringify(batchRequests) });
           const data = await res.json();
           const thumbs = {};
           for (const e of data.data || []) { if (e.token) thumbs[e.token] = e.imageUrl; }
-          enriched.push({ id: s.id, playing: s.playing, maxPlayers: s.maxPlayers, playerTokens: s.playerTokens, thumbnails: thumbs });
+          enriched.push({ id: s.id, playing: s.playing, maxPlayers: s.maxPlayers, playerTokens: s.playerTokens, thumbnails: thumbs, isFull: s.maxPlayers > 0 && s.playing >= s.maxPlayers });
         } catch {}
       }
       liveDataCache.clear();
@@ -305,9 +377,8 @@ app.post("/donation", async (req, res) => {
   if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
   const amount = parseInt(String(robux).replace(/,/g, ""), 10);
   if (isNaN(amount) || amount < 1000) return res.status(400).json({ ok: false, message: "Amount must be 1000 or above" });
-  const entry = { donor: String(donor), receiver: String(receiver), robux: amount, id: randomUUID(), ts: Date.now(), serverId: null, placeId: null, joinTarget: null };
+  const entry = { donor: String(donor), receiver: String(receiver), robux: amount, id: randomUUID(), ts: Date.now(), serverId: null, placeId: null, joinTarget: null, serverFull: false, serverPlaying: null, serverMaxPlayers: null };
   addDonation(entry);
-  console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
   res.json({ ok: true });
   if (ROBLOSECURITY) {
     try {
@@ -318,27 +389,53 @@ app.post("/donation", async (req, res) => {
         entry.serverId = found.gameId;
         entry.placeId = found.placeId;
         entry.joinTarget = target;
-        console.log(`[donation] serverId:${found.gameId} joinTarget:${target} for ${entry.id}`);
-        setTimeout(() => { entry.serverId = null; entry.placeId = null; entry.joinTarget = null; }, SERVER_ID_TTL_MS);
+        const cap = serverCapacityCache.get(found.gameId);
+        if (cap) {
+          entry.serverPlaying = cap.playing;
+          entry.serverMaxPlayers = cap.maxPlayers;
+          entry.serverFull = cap.maxPlayers > 0 && cap.playing >= cap.maxPlayers;
+        } else {
+          await refreshServerCapacity(found.gameId);
+          const cap2 = serverCapacityCache.get(found.gameId);
+          if (cap2) {
+            entry.serverPlaying = cap2.playing;
+            entry.serverMaxPlayers = cap2.maxPlayers;
+            entry.serverFull = cap2.maxPlayers > 0 && cap2.playing >= cap2.maxPlayers;
+          }
+        }
+        setTimeout(() => { entry.serverId = null; entry.placeId = null; entry.joinTarget = null; entry.serverFull = false; }, SERVER_ID_TTL_MS);
       }
-    } catch (e) { console.log(`[donation presence error] ${e.message}`); }
+    } catch {}
   }
 });
 
 app.get("/donations", (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), MAX_DONATIONS);
-  res.json({ ok: true, count: Math.min(limit, donationStore.length), donations: donationStore.slice(0, limit) });
+  const includeFullServers = req.query.includeFull === "1";
+  let filtered = donationStore;
+  if (!includeFullServers) {
+    filtered = donationStore.filter(d => !d.serverFull);
+  }
+  res.json({ ok: true, count: Math.min(limit, filtered.length), donations: filtered.slice(0, limit) });
 });
 
 app.get("/donations/latest", (req, res) => {
-  if (!donationStore.length) return res.json({ ok: true, donation: null });
-  res.json({ ok: true, donation: donationStore[0] });
+  const includeFullServers = req.query.includeFull === "1";
+  const filtered = includeFullServers ? donationStore : donationStore.filter(d => !d.serverFull);
+  if (!filtered.length) return res.json({ ok: true, donation: null });
+  res.json({ ok: true, donation: filtered[0] });
 });
 
 app.get("/donation/:id", (req, res) => {
   const entry = donationStore.find(d => d.id === req.params.id);
   if (!entry) return res.status(404).json({ ok: false });
   res.json({ ok: true, donation: entry });
+});
+
+app.get("/server-capacity/:serverId", (req, res) => {
+  const cap = serverCapacityCache.get(req.params.serverId);
+  if (!cap) return res.json({ ok: false, message: "Not cached" });
+  res.json({ ok: true, serverId: req.params.serverId, playing: cap.playing, maxPlayers: cap.maxPlayers, isFull: cap.maxPlayers > 0 && cap.playing >= cap.maxPlayers, ts: cap.ts });
 });
 
 app.get("/live-servers", (req, res) => res.json(Array.from(liveDataCache.values())));
@@ -388,7 +485,6 @@ app.post("/presence-check", async (req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`[server] port:${PORT} | ROBLOSECURITY:${ROBLOSECURITY ? "SET" : "NOT SET"} | UNIVERSE_ID:${DEFAULT_UNIVERSE_ID}`);
   startLiveBroadcast();
 });
 
