@@ -25,6 +25,7 @@ const liveDataCache = new Map();
 const serverCapacityCache = new Map();
 let liveBroadcastInterval = null;
 const donationStore = [];
+const donationSubscribers = new Map();
 
 function setServerCapacity(serverId, playing, maxPlayers) {
   serverCapacityCache.set(serverId, { playing, maxPlayers, ts: Date.now() });
@@ -41,6 +42,12 @@ function isServerFull(serverId) {
 function addDonation(entry) {
   donationStore.unshift(entry);
   if (donationStore.length > MAX_DONATIONS) donationStore.length = MAX_DONATIONS;
+
+  const payload = JSON.stringify({ type: "donation", donation: entry });
+  for (const ws of donationSubscribers.values()) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+  }
+
   setTimeout(() => {
     const idx = donationStore.findIndex(d => d.id === entry.id);
     if (idx !== -1) donationStore.splice(idx, 1);
@@ -131,15 +138,6 @@ async function checkPresenceForJoinFull(username) {
   } catch { return null; }
 }
 
-async function fetchServerCapacity(serverId) {
-  try {
-    const res = await apiFetch(`https://games.roblox.com/v1/games/multiget-place-details?placeIds=${DEFAULT_PLACE_ID}`);
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data?.[0] || null;
-  } catch { return null; }
-}
-
 async function refreshServerCapacity(serverId) {
   try {
     const url = new URL(`https://games.roblox.com/v1/games/${DEFAULT_PLACE_ID}/servers/Public`);
@@ -207,7 +205,7 @@ async function fetchServersPage(placeId, sortOrder, limit, cursor = null) {
   return { servers, nextCursor: data.nextPageCursor || null };
 }
 
-async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
+async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onStep) {
   const found = { value: false, result: null };
   const serverQueue = [];
   let queueResolve = null;
@@ -224,7 +222,9 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
       try {
         const { servers, nextCursor } = await fetchServersPage(placeId, sortOrder, limit, cursor);
         seen += servers.length; pages++;
-        job.step = `W${workerId} ${sortOrder} L${limit} p${pages} s${seen}`;
+        const step = `Scanning servers... (${seen} checked)`;
+        if (onStep) onStep(step);
+        job.step = step;
         if (servers.length) { serverQueue.push(...servers); notifyQueue(); }
         cursor = nextCursor;
         if (!cursor) break;
@@ -274,70 +274,101 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount) {
   return found.result;
 }
 
-async function runSearch(jobId, username, placeId, instanceCount) {
-  const job = jobs.get(jobId);
-  if (!job) return;
+async function runSearchWS(ws, username, placeId, instanceCount) {
+  const send = (obj) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); };
+  const job = { cancelled: false, step: "Starting..." };
+
+  ws.on("close", () => { job.cancelled = true; });
+
   try {
-    job.step = `Resolving ${username}...`;
+    send({ status: "update", msg: `Resolving ${username}...` });
     const { userId, displayName } = await resolveUser(username);
-    if (!userId) { job.status = "done"; job.result = { found: false, message: `User "${username}" does not exist` }; return; }
-    job.userId = userId;
-    const [thumb150, thumb48, thumb720] = await Promise.all([resolveHeadshot(userId, "150x150"), resolveHeadshot(userId, "48x48"), resolveHeadshot(userId, "720x720")]);
-    job.step = "Checking presence...";
-    const presence = await getPresenceStatus(userId, placeId);
-    if (presence.type === "offline") { job.status = "done"; job.result = { found: false, message: `${displayName} is offline`, presenceStatus: "offline" }; return; }
-    if (presence.type === "online") { job.status = "done"; job.result = { found: false, message: `${displayName} is on website but not in game`, presenceStatus: "online" }; return; }
-    if (presence.inGame && presence.gameId && presence.inThisGame) {
-      const playing = 0;
-      const maxPlayers = 0;
-      const cap = serverCapacityCache.get(presence.gameId);
-      job.status = "done";
-      job.result = {
-        found: true,
-        serverId: presence.gameId,
-        placeId: String(placeId),
-        userId: String(userId),
-        displayName,
-        thumbnailUrl: thumb150,
-        foundInInstance: 1,
-        matchType: "presence",
-        serverPlaying: cap ? cap.playing : null,
-        serverMaxPlayers: cap ? cap.maxPlayers : null,
-        serverFull: cap ? isServerFull(presence.gameId) : false
-      };
+    if (!userId) {
+      send({ status: "done", result: "not_found", msg: `User "${username}" does not exist` });
       return;
     }
+
+    const [thumb150, thumb48, thumb720] = await Promise.all([
+      resolveHeadshot(userId, "150x150"),
+      resolveHeadshot(userId, "48x48"),
+      resolveHeadshot(userId, "720x720")
+    ]);
+
     if (job.cancelled) return;
-    job.step = `Deep scanning with ${instanceCount} workers...`;
-    const result = await deepSnipe(job, userId, [thumb48, thumb720], placeId, instanceCount);
+    send({ status: "update", msg: "Checking presence..." });
+
+    const presence = await getPresenceStatus(userId, placeId);
+    if (presence.type === "offline") {
+      send({ status: "done", result: "not_found", msg: `${displayName} is offline` });
+      return;
+    }
+    if (presence.type === "online") {
+      send({ status: "done", result: "not_found", msg: `${displayName} is on website, not in-game` });
+      return;
+    }
+    if (presence.inGame && presence.gameId && presence.inThisGame) {
+      const cap = serverCapacityCache.get(presence.gameId);
+      send({
+        status: "done",
+        result: "found",
+        data: {
+          serverId: presence.gameId,
+          placeId: String(placeId),
+          userId: String(userId),
+          displayName,
+          thumbnailUrl: thumb150,
+          matchType: "presence",
+          players: cap ? `${cap.playing}/${cap.maxPlayers}` : "?",
+          placename: "PLS DONATE 💸",
+          serverFull: cap ? isServerFull(presence.gameId) : false
+        }
+      });
+      return;
+    }
+
     if (job.cancelled) return;
-    job.status = "done";
+    send({ status: "update", msg: `Deep scanning with ${instanceCount} workers...` });
+
+    const onStep = (msg) => {
+      if (!job.cancelled) send({ status: "update", msg });
+    };
+
+    const result = await deepSnipe(job, userId, [thumb48, thumb720], placeId, instanceCount, onStep);
+    if (job.cancelled) return;
+
     if (result) {
       if (result.playing != null && result.maxPlayers != null) {
         setServerCapacity(result.serverId, result.playing, result.maxPlayers);
       }
-      job.result = {
-        found: true,
-        serverId: result.serverId,
-        placeId: String(placeId),
-        userId: String(userId),
-        displayName,
-        thumbnailUrl: thumb150,
-        foundInInstance: 1,
-        matchType: result.matchType,
-        serverPlaying: result.playing ?? null,
-        serverMaxPlayers: result.maxPlayers ?? null,
-        serverFull: isServerFull(result.serverId)
-      };
+      send({
+        status: "done",
+        result: "found",
+        data: {
+          serverId: result.serverId,
+          placeId: String(placeId),
+          userId: String(userId),
+          displayName,
+          thumbnailUrl: thumb150,
+          matchType: result.matchType,
+          players: result.playing != null ? `${result.playing}/${result.maxPlayers}` : "?",
+          placename: "PLS DONATE 💸",
+          serverFull: isServerFull(result.serverId)
+        }
+      });
     } else {
       const finalPresence = await getPresenceStatus(userId, placeId);
       const privateGuess = finalPresence.inGame && finalPresence.inThisGame;
-      job.result = { found: false, message: privateGuess ? "Player is likely in a private server" : "Player not found in any public server", possiblePrivate: true };
+      send({
+        status: "done",
+        result: "not_found",
+        msg: privateGuess ? "Player is likely in a private server" : "Player not found in any public server",
+        possiblePrivate: privateGuess
+      });
     }
   } catch (err) {
-    if (job.cancelled) return;
-    job.status = "done";
-    job.result = { found: false, message: "Internal error: " + err.message };
+    if (!job.cancelled) {
+      send({ status: "error", msg: "Internal error: " + err.message });
+    }
   }
 }
 
@@ -403,6 +434,10 @@ app.post("/donation", async (req, res) => {
             entry.serverFull = cap2.maxPlayers > 0 && cap2.playing >= cap2.maxPlayers;
           }
         }
+        const updatedPayload = JSON.stringify({ type: "donation_update", donation: entry });
+        for (const ws of donationSubscribers.values()) {
+          if (ws.readyState === WebSocket.OPEN) ws.send(updatedPayload);
+        }
         setTimeout(() => { entry.serverId = null; entry.placeId = null; entry.joinTarget = null; entry.serverFull = false; }, SERVER_ID_TTL_MS);
       }
     } catch {}
@@ -413,9 +448,7 @@ app.get("/donations", (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), MAX_DONATIONS);
   const includeFullServers = req.query.includeFull === "1";
   let filtered = donationStore;
-  if (!includeFullServers) {
-    filtered = donationStore.filter(d => !d.serverFull);
-  }
+  if (!includeFullServers) filtered = donationStore.filter(d => !d.serverFull);
   res.json({ ok: true, count: Math.min(limit, filtered.length), donations: filtered.slice(0, limit) });
 });
 
@@ -458,7 +491,6 @@ app.post("/search", async (req, res) => {
   const workers = Math.min(Math.max(Number(instanceCount) || 1, 1), MAX_WORKERS);
   jobs.set(jobId, { status: "running", step: "Starting...", result: null, startedAt: Date.now(), cancelled: false, userId: null, placeId: placeId || DEFAULT_PLACE_ID });
   res.json({ ok: true, jobId });
-  runSearch(jobId, username, placeId || DEFAULT_PLACE_ID, workers);
   setTimeout(() => jobs.delete(jobId), JOB_TTL_MS);
 });
 
@@ -490,11 +522,51 @@ const server = app.listen(PORT, () => {
 
 setInterval(() => { fetch(`http://localhost:${PORT}/`).catch(() => {}); }, 14 * 60 * 1000);
 
-const wss = new WebSocket.Server({ server, path: "/live" });
-wss.on("connection", (ws) => {
-  const id = randomUUID();
-  liveSubscribers.set(id, ws);
-  if (liveDataCache.size) ws.send(JSON.stringify(Array.from(liveDataCache.values())));
-  ws.on("close", () => liveSubscribers.delete(id));
-  ws.on("error", () => liveSubscribers.delete(id));
+const wss = new WebSocket.Server({ server });
+
+wss.on("connection", (ws, req) => {
+  const url = new URL(req.url, `http://localhost`);
+  const path = url.pathname;
+
+  if (path === "/live") {
+    const id = randomUUID();
+    liveSubscribers.set(id, ws);
+    if (liveDataCache.size) ws.send(JSON.stringify(Array.from(liveDataCache.values())));
+    ws.on("close", () => liveSubscribers.delete(id));
+    ws.on("error", () => liveSubscribers.delete(id));
+    return;
+  }
+
+  if (path === "/donations/live") {
+    const id = randomUUID();
+    donationSubscribers.set(id, ws);
+    const recent = donationStore.slice(0, 20);
+    if (recent.length) ws.send(JSON.stringify({ type: "history", donations: recent }));
+    ws.on("close", () => donationSubscribers.delete(id));
+    ws.on("error", () => donationSubscribers.delete(id));
+    return;
+  }
+
+  if (path === "/sniper") {
+    const username = url.searchParams.get("username");
+    const placeId = url.searchParams.get("placeId") || DEFAULT_PLACE_ID;
+    const instanceCount = Math.min(Math.max(parseInt(url.searchParams.get("instances") || "1"), 1), MAX_WORKERS);
+
+    ws.send(JSON.stringify({ status: "connected" }));
+
+    ws.once("message", async (raw) => {
+      let payload;
+      try { payload = JSON.parse(raw); } catch { ws.close(); return; }
+      const targetUsername = payload.username || username;
+      const targetPlaceId = payload.placeId || placeId;
+      const targetInstances = Math.min(Math.max(parseInt(payload.instances || instanceCount), 1), MAX_WORKERS);
+      if (!targetUsername) { ws.send(JSON.stringify({ status: "error", msg: "Missing username" })); ws.close(); return; }
+      await runSearchWS(ws, targetUsername, targetPlaceId, targetInstances);
+      if (ws.readyState === WebSocket.OPEN) ws.close();
+    });
+
+    return;
+  }
+
+  ws.close();
 });
