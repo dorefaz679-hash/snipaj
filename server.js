@@ -40,6 +40,7 @@ function isServerFull(serverId) {
 }
 
 function addDonation(entry) {
+  console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
   donationStore.unshift(entry);
   if (donationStore.length > MAX_DONATIONS) donationStore.length = MAX_DONATIONS;
 
@@ -111,6 +112,7 @@ async function getPresenceStatus(userId, placeId) {
     const inGame = p.userPresenceType === 2;
     const userPlaceId = String(p.rootPlaceId || p.placeId || "");
     const inThisGame = inGame && (userPlaceId === String(placeId) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID));
+    console.log(`[presence] ${userId} inThisGame:${inThisGame} gameId:${p.gameId||null} placeId:${userPlaceId} universeId:${p.universeId||null}`);
     return {
       type: p.userPresenceType === 0 ? "offline" : p.userPresenceType === 1 ? "online" : p.userPresenceType === 2 ? "ingame" : "unknown",
       inGame, inThisGame,
@@ -298,6 +300,7 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
     send({ status: "update", msg: "Checking presence..." });
 
     const presence = await getPresenceStatus(userId, placeId);
+    console.log(`[sniper] ${username} presence:${presence.type} inThisGame:${presence.inThisGame} gameId:${presence.gameId||null}`);
     if (presence.type === "offline") {
       send({ status: "done", result: "not_found", msg: `${displayName} is offline` });
       return;
@@ -340,6 +343,7 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
       if (result.playing != null && result.maxPlayers != null) {
         setServerCapacity(result.serverId, result.playing, result.maxPlayers);
       }
+      console.log(`[sniper] FOUND ${username} serverId:${result.serverId} matchType:${result.matchType}`);
       send({
         status: "done",
         result: "found",
@@ -358,6 +362,7 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
     } else {
       const finalPresence = await getPresenceStatus(userId, placeId);
       const privateGuess = finalPresence.inGame && finalPresence.inThisGame;
+      console.log(`[sniper] NOT FOUND ${username} possiblePrivate:${privateGuess}`);
       send({
         status: "done",
         result: "not_found",
@@ -420,6 +425,7 @@ app.post("/donation", async (req, res) => {
         entry.serverId = found.gameId;
         entry.placeId = found.placeId;
         entry.joinTarget = target;
+        console.log(`[donation] serverId:${entry.serverId} joinTarget:${entry.joinTarget} for ${entry.id}`);
         const cap = serverCapacityCache.get(found.gameId);
         if (cap) {
           entry.serverPlaying = cap.playing;
