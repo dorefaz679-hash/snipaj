@@ -31,6 +31,7 @@ const donationStore = [];
 const donationSubscribers = new Map();
 const presenceCache = new Map();
 const pendingEnrichment = new Map();
+const enrichmentInFlight = new Set();
 
 function setServerCapacity(serverId, playing, maxPlayers) {
   serverCapacityCache.set(serverId, { playing, maxPlayers, ts: Date.now() });
@@ -57,6 +58,8 @@ function addDonation(entry) {
   setTimeout(() => {
     const idx = donationStore.findIndex(d => d.id === entry.id);
     if (idx !== -1) donationStore.splice(idx, 1);
+    pendingEnrichment.delete(entry.id);
+    enrichmentInFlight.delete(entry.id);
   }, DONATION_TTL_MS);
 }
 
@@ -445,23 +448,35 @@ function startLiveBroadcast() {
 }
 
 async function enrichDonationWithRetries(entry, targetUsername) {
-  for (let attempt = 0; attempt < ENRICHMENT_RETRIES; attempt++) {
-    const found = await checkPresenceForJoinFull(targetUsername);
-    if (found) {
-      updateDonationWithServer(entry, found.gameId, found.placeId, targetUsername);
-      pendingEnrichment.delete(entry.id);
-      return;
+  if (enrichmentInFlight.has(entry.id)) return;
+  enrichmentInFlight.add(entry.id);
+
+  try {
+    for (let attempt = 0; attempt < ENRICHMENT_RETRIES; attempt++) {
+      if (!pendingEnrichment.has(entry.id)) return;
+
+      const found = await checkPresenceForJoinFull(targetUsername);
+      if (found) {
+        updateDonationWithServer(entry, found.gameId, found.placeId, targetUsername);
+        pendingEnrichment.delete(entry.id);
+        return;
+      }
+      if (attempt < ENRICHMENT_RETRIES - 1) {
+        await sleep(ENRICHMENT_RETRY_BASE_DELAY * Math.pow(2, attempt));
+      }
     }
-    if (attempt < ENRICHMENT_RETRIES - 1) {
-      await sleep(ENRICHMENT_RETRY_BASE_DELAY * Math.pow(2, attempt));
-    }
+
+    console.log(`[donation] enrichment failed for ${entry.id} after ${ENRICHMENT_RETRIES} attempts`);
+    pendingEnrichment.delete(entry.id);
+  } finally {
+    enrichmentInFlight.delete(entry.id);
   }
-  console.log(`[donation] enrichment failed for ${entry.id} after ${ENRICHMENT_RETRIES} attempts`);
-  pendingEnrichment.delete(entry.id);
 }
 
 async function processPendingEnrichments() {
-  const entries = Array.from(pendingEnrichment.values());
+  const entries = Array.from(pendingEnrichment.values()).filter(({ entry }) => !enrichmentInFlight.has(entry.id));
+  if (!entries.length) return;
+
   const batches = [];
   for (let i = 0; i < entries.length; i += 10) {
     batches.push(entries.slice(i, i + 10));
