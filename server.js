@@ -145,7 +145,8 @@ function updateDonationWithServer(entry, gameId, placeId, targetUsername) {
     entry.serverFull = cap.maxPlayers > 0 && cap.playing >= cap.maxPlayers;
   }
 
-  console.log(`[donation] serverId:${gameId} joinTarget:${targetUsername} for ${entry.id}`);
+const playersStr = cap ? `${cap.playing}/${cap.maxPlayers}` : "?/?";
+console.log(`[donation] serverId:${gameId} | joinTarget:${targetUsername} | playing:${playersStr} | id:${entry.id}`);
 
   const updatedPayload = JSON.stringify({ type: "donation_update", donation: entry });
   for (const ws of donationSubscribers.values()) {
