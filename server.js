@@ -27,9 +27,8 @@ const DONATION_TTL_MS = 5 * 60 * 1000;
 const SERVER_ID_TTL_MS = 30 * 1000;
 const SERVER_CAPACITY_TTL_MS = 90 * 1000;
 const PRESENCE_CACHE_TTL_MS = 10 * 1000;
-const ENRICHMENT_RETRIES = 8;
-const ENRICHMENT_RETRY_BASE_DELAY = 800;
-const AUTH_KEY_TTL_MS = 30 * 1000;
+const ENRICHMENT_RETRIES = 10;
+const ENRICHMENT_RETRY_BASE_DELAY = 600;
 
 const supabase = createClient(
   process.env.SUPABASE_URL || "",
@@ -101,12 +100,12 @@ const donationSubscribers = new Map();
 const presenceCache = new Map();
 const pendingEnrichment = new Map();
 const enrichmentInFlight = new Set();
-const authKeys = new Map();
-const subscriptionSockets = new Map();
 
 function setServerCapacity(serverId, playing, maxPlayers) {
-  serverCapacityCache.set(serverId, { playing, maxPlayers, ts: Date.now() });
-  setTimeout(() => serverCapacityCache.delete(serverId), SERVER_CAPACITY_TTL_MS);
+  if (serverId && maxPlayers != null && maxPlayers > 0) {
+    serverCapacityCache.set(serverId, { playing: playing || 0, maxPlayers, ts: Date.now() });
+    setTimeout(() => serverCapacityCache.delete(serverId), SERVER_CAPACITY_TTL_MS);
+  }
 }
 
 function isServerFull(serverId) {
@@ -116,27 +115,55 @@ function isServerFull(serverId) {
 }
 
 async function fetchAndCacheServerCapacity(serverId, placeId) {
-  try {
-    const targetPlaceIds = placeId ? [String(placeId)] : ALL_PLACE_IDS;
-    for (const pid of targetPlaceIds) {
-      const url = new URL(`https://games.roblox.com/v1/games/${pid}/servers/Public`);
-      url.searchParams.set("sortOrder", "Asc");
-      url.searchParams.set("limit", "100");
-      const res = await apiFetch(url.toString());
-      if (!res.ok) continue;
-      const data = await res.json();
-      const servers = data.data || [];
-      for (const s of servers) {
-        if (s.id && s.maxPlayers != null) {
-          setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+  if (!serverId) return null;
+
+  const existing = serverCapacityCache.get(serverId);
+  if (existing && existing.maxPlayers > 0 && (Date.now() - existing.ts) < 30000) {
+    return { playing: existing.playing, maxPlayers: existing.maxPlayers };
+  }
+
+  const targetPlaceIds = placeId ? [String(placeId)] : ALL_PLACE_IDS;
+
+  for (const pid of targetPlaceIds) {
+    let cursor = null;
+    let pages = 0;
+    while (pages < 6) {
+      try {
+        const url = new URL(`https://games.roblox.com/v1/games/${pid}/servers/Public`);
+        url.searchParams.set("sortOrder", "Asc");
+        url.searchParams.set("limit", "100");
+        if (cursor) url.searchParams.set("cursor", cursor);
+
+        const res = await apiFetch(url.toString());
+        if (!res.ok) break;
+        const data = await res.json();
+        const servers = data.data || [];
+
+        for (const s of servers) {
+          if (s.id && s.maxPlayers != null && s.maxPlayers > 0) {
+            setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+          }
+          if (s.id === serverId) {
+            return { playing: s.playing || 0, maxPlayers: s.maxPlayers };
+          }
         }
-        if (s.id === serverId) {
-          return { playing: s.playing || 0, maxPlayers: s.maxPlayers };
-        }
-      }
+
+        cursor = data.nextPageCursor || null;
+        pages++;
+        if (!cursor) break;
+      } catch { break; }
     }
-  } catch {}
+  }
+
   return null;
+}
+
+async function validateServerStillAlive(serverId, placeId) {
+  if (!serverId) return { alive: false, reason: "no_id" };
+  const result = await fetchAndCacheServerCapacity(serverId, placeId);
+  if (!result) return { alive: false, reason: "not_found" };
+  if (result.playing === 0 && result.maxPlayers === 0) return { alive: false, reason: "gone" };
+  return { alive: true, playing: result.playing, maxPlayers: result.maxPlayers };
 }
 
 function addDonation(entry) {
@@ -166,23 +193,25 @@ async function updateDonationWithServer(entry, gameId, placeId, targetUsername) 
 
   if (!cap || cap.maxPlayers == null || cap.maxPlayers === 0) {
     const fetched = await fetchAndCacheServerCapacity(gameId, placeId);
-    if (fetched) {
+    if (fetched && fetched.maxPlayers > 0) {
       setServerCapacity(gameId, fetched.playing, fetched.maxPlayers);
       cap = { playing: fetched.playing, maxPlayers: fetched.maxPlayers };
     }
   }
 
-  if (cap && cap.maxPlayers != null) {
+  if (cap && cap.maxPlayers != null && cap.maxPlayers > 0) {
     entry.serverPlaying = cap.playing;
     entry.serverMaxPlayers = cap.maxPlayers;
-    entry.serverFull = cap.maxPlayers > 0 && cap.playing >= cap.maxPlayers;
+    entry.serverFull = cap.playing >= cap.maxPlayers;
+    entry.serverGone = false;
   } else {
     entry.serverPlaying = null;
     entry.serverMaxPlayers = null;
     entry.serverFull = false;
+    entry.serverGone = false;
   }
 
-  const playersStr = cap ? `${cap.playing}/${cap.maxPlayers}` : "?/?";
+  const playersStr = cap && cap.maxPlayers > 0 ? `${cap.playing}/${cap.maxPlayers}` : "?/?";
   console.log(`[donation] serverId:${gameId} | joinTarget:${targetUsername} | playing:${playersStr} | id:${entry.id}`);
 
   const updatedPayload = JSON.stringify({ type: "donation_update", donation: entry });
@@ -195,6 +224,7 @@ async function updateDonationWithServer(entry, gameId, placeId, targetUsername) 
     entry.placeId = null;
     entry.joinTarget = null;
     entry.serverFull = false;
+    entry.serverGone = false;
   }, SERVER_ID_TTL_MS);
 }
 
@@ -295,7 +325,9 @@ async function checkPresenceForJoinFull(username) {
 
 async function batchMatchServer(server, targetUserId, thumbnailUrls) {
   if (!server.playerTokens?.length) return null;
-  if (server.maxPlayers != null) setServerCapacity(server.id, server.playing || 0, server.maxPlayers);
+  if (server.maxPlayers != null && server.maxPlayers > 0) {
+    setServerCapacity(server.id, server.playing || 0, server.maxPlayers);
+  }
 
   const tokens = server.playerTokens.slice(0, 100);
   const tokenMap = new Map();
@@ -337,25 +369,11 @@ async function fetchServersPage(placeId, sortOrder, limit, cursor = null) {
     .filter(s => s.playerTokens?.length && (!s.maxPlayers || (s.playing / s.maxPlayers) >= MIN_CAPACITY_RATIO))
     .map(s => ({ ...s, _placeId: String(placeId) }));
   for (const s of servers) {
-    if (s.id && s.maxPlayers != null) setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+    if (s.id && s.maxPlayers != null && s.maxPlayers > 0) {
+      setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+    }
   }
   return { servers, nextCursor: data.nextPageCursor || null };
-}
-
-async function fetchServersPageAllPlaces(sortOrder, limit, cursors = {}) {
-  const results = await Promise.allSettled(
-    ALL_PLACE_IDS.map(pid => fetchServersPage(pid, sortOrder, limit, cursors[pid] || null))
-  );
-  const servers = [];
-  const nextCursors = {};
-  results.forEach((r, i) => {
-    const pid = ALL_PLACE_IDS[i];
-    if (r.status === "fulfilled") {
-      servers.push(...r.value.servers);
-      if (r.value.nextCursor) nextCursors[pid] = r.value.nextCursor;
-    }
-  });
-  return { servers, nextCursors };
 }
 
 async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onStep) {
@@ -373,7 +391,7 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onSte
     if (queueResolve) { const r = queueResolve; queueResolve = null; r(); }
   };
 
-  const fetcher = async (startCursor, sortOrder, limit, targetPid, workerId) => {
+  const fetcher = async (startCursor, sortOrder, limit, targetPid) => {
     let cursor = startCursor;
     let pages = 0, seen = 0;
     while (!found.value && !job.cancelled && pages < maxPages) {
@@ -415,7 +433,6 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onSte
 
   const perPlace = Math.max(1, Math.floor(totalFetchers / targetPlaceIds.length));
   const workers = [];
-  let workerId = 1;
 
   for (const pid of targetPlaceIds) {
     for (const sort of sortOrders) {
@@ -423,33 +440,38 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onSte
         const perCombo = Math.max(1, Math.floor(perPlace / (sortOrders.length * limits.length)));
         for (let i = 0; i < perCombo; i++) {
           if (workers.length >= totalFetchers) break;
-          workers.push(fetcher(null, sort, limit, pid, workerId++));
+          workers.push(fetcher(null, sort, limit, pid));
         }
       }
     }
   }
   while (workers.length < totalFetchers) {
     const pid = targetPlaceIds[workers.length % targetPlaceIds.length];
-    workers.push(fetcher(null, "Asc", 100, pid, workerId++));
+    workers.push(fetcher(null, "Asc", 100, pid));
   }
 
   await Promise.race([Promise.allSettled(workers), matcher()]);
   return found.result;
 }
 
-async function runSearchWS(ws, username, placeId, instanceCount) {
-  const send = (obj) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); };
-  const job = { cancelled: false, step: "Starting..." };
+async function runSearch(jobId, username, placeId, instanceCount) {
+  const job = jobs.get(jobId);
+  if (!job) return;
 
-  ws.on("close", () => { job.cancelled = true; });
+  const updateJob = (updates) => {
+    const j = jobs.get(jobId);
+    if (j) Object.assign(j, updates);
+  };
 
   try {
-    send({ status: "update", msg: `Resolving ${username}...` });
+    updateJob({ step: `Resolving ${username}...` });
     const { userId, displayName } = await resolveUser(username);
     if (!userId) {
-      send({ status: "done", result: "not_found", msg: `User "${username}" does not exist` });
+      updateJob({ status: "done", result: { found: false, message: `User "${username}" does not exist` } });
       return;
     }
+
+    updateJob({ userId });
 
     const [thumb150, thumb48, thumb720] = await Promise.all([
       resolveHeadshot(userId, "150x150"),
@@ -458,92 +480,101 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
     ]);
 
     if (job.cancelled) return;
-    send({ status: "update", msg: "Checking presence..." });
+    updateJob({ step: "Checking presence..." });
 
     const presence = await getPresenceStatus(userId, placeId);
     if (presence.type === "offline") {
-      send({ status: "done", result: "not_found", msg: `${displayName} is offline` });
+      updateJob({ status: "done", result: { found: false, message: `${displayName} is offline` } });
       return;
     }
     if (presence.type === "online") {
-      send({ status: "done", result: "not_found", msg: `${displayName} is on website, not in-game` });
+      updateJob({ status: "done", result: { found: false, message: `${displayName} is on website, not in-game` } });
       return;
     }
+
     if (presence.inGame && presence.gameId && presence.inThisGame) {
+      updateJob({ step: "Fetching server capacity..." });
       let cap = serverCapacityCache.get(presence.gameId);
       if (!cap || cap.maxPlayers == null || cap.maxPlayers === 0) {
         const fetched = await fetchAndCacheServerCapacity(presence.gameId, presence.placeId || placeId);
-        if (fetched) {
+        if (fetched && fetched.maxPlayers > 0) {
           setServerCapacity(presence.gameId, fetched.playing, fetched.maxPlayers);
-          cap = { playing: fetched.playing, maxPlayers: fetched.maxPlayers };
+          cap = fetched;
         }
       }
-      const foundPlaceId = presence.placeId || String(placeId);
-      send({
+      const validation = await validateServerStillAlive(presence.gameId, presence.placeId || placeId);
+      updateJob({
         status: "done",
-        result: "found",
-        data: {
+        result: {
+          found: true,
           serverId: presence.gameId,
-          placeId: foundPlaceId,
+          placeId: presence.placeId || String(placeId),
           userId: String(userId),
           displayName,
           thumbnailUrl: thumb150,
           matchType: "presence",
-          players: cap ? `${cap.playing}/${cap.maxPlayers}` : "?",
+          players: cap && cap.maxPlayers > 0 ? `${cap.playing}/${cap.maxPlayers}` : "?",
+          serverPlaying: cap ? cap.playing : null,
+          serverMaxPlayers: cap ? cap.maxPlayers : null,
           placename: "PLS DONATE 💸",
-          serverFull: cap ? isServerFull(presence.gameId) : false
+          serverFull: cap ? isServerFull(presence.gameId) : false,
+          serverGone: !validation.alive
         }
       });
       return;
     }
 
     if (job.cancelled) return;
-    send({ status: "update", msg: `Deep scanning ${ALL_PLACE_IDS.length} places with ${instanceCount} workers...` });
+    updateJob({ step: `Deep scanning ${ALL_PLACE_IDS.length} places with ${instanceCount} workers...` });
 
     const result = await deepSnipe(job, userId, [thumb48, thumb720], placeId, instanceCount, (msg) => {
-      if (!job.cancelled) send({ status: "update", msg });
+      updateJob({ step: msg });
     });
 
     if (job.cancelled) return;
 
     if (result) {
-      if (result.playing != null && result.maxPlayers != null) {
-        setServerCapacity(result.serverId, result.playing, result.maxPlayers);
-      } else {
+      if (!result.maxPlayers || result.maxPlayers === 0) {
         const fetched = await fetchAndCacheServerCapacity(result.serverId, result.placeId || placeId);
-        if (fetched) {
+        if (fetched && fetched.maxPlayers > 0) {
           setServerCapacity(result.serverId, fetched.playing, fetched.maxPlayers);
           result.playing = fetched.playing;
           result.maxPlayers = fetched.maxPlayers;
         }
       }
-      send({
+      const validation = await validateServerStillAlive(result.serverId, result.placeId || placeId);
+      updateJob({
         status: "done",
-        result: "found",
-        data: {
+        result: {
+          found: true,
           serverId: result.serverId,
           placeId: result.placeId || String(placeId),
           userId: String(userId),
           displayName,
           thumbnailUrl: thumb150,
           matchType: result.matchType,
-          players: result.playing != null ? `${result.playing}/${result.maxPlayers}` : "?",
+          players: result.playing != null && result.maxPlayers > 0 ? `${result.playing}/${result.maxPlayers}` : "?",
+          serverPlaying: result.playing || null,
+          serverMaxPlayers: result.maxPlayers || null,
           placename: "PLS DONATE 💸",
-          serverFull: isServerFull(result.serverId)
+          serverFull: isServerFull(result.serverId),
+          serverGone: !validation.alive
         }
       });
     } else {
       const finalPresence = await getPresenceStatus(userId, placeId);
       const privateGuess = finalPresence.inGame && finalPresence.inThisGame;
-      send({
+      updateJob({
         status: "done",
-        result: "not_found",
-        msg: privateGuess ? "Player is likely in a private server" : "Player not found in any public server",
-        possiblePrivate: privateGuess
+        result: {
+          found: false,
+          message: privateGuess ? "Player is likely in a private server" : "Player not found in any public server",
+          possiblePrivate: privateGuess
+        }
       });
     }
   } catch (err) {
-    if (!job.cancelled) send({ status: "error", msg: "Internal error: " + err.message });
+    updateJob({ status: "done", result: { found: false, message: "Internal error: " + err.message } });
   }
 }
 
@@ -564,7 +595,9 @@ function startLiveBroadcast() {
       for (const s of allServers.slice(0, 30)) {
         const tokens = s.playerTokens.slice(0, 10);
         if (!tokens.length) continue;
-        if (s.id && s.maxPlayers != null) setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+        if (s.id && s.maxPlayers != null && s.maxPlayers > 0) {
+          setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+        }
         const batchRequests = tokens.map(t => ({
           requestId: `0:${t}:AvatarHeadShot:48x48:png:regular`,
           token: t,
@@ -642,7 +675,7 @@ async function enrichDonationWithRetries(entry, targetUsername) {
       }
 
       if (attempt < ENRICHMENT_RETRIES - 1) {
-        const delay = Math.min(ENRICHMENT_RETRY_BASE_DELAY * Math.pow(1.6, attempt), 15000);
+        const delay = Math.min(ENRICHMENT_RETRY_BASE_DELAY * Math.pow(1.5, attempt), 12000);
         await sleep(delay);
       }
     }
@@ -710,6 +743,7 @@ app.post("/donation", async (req, res) => {
     placeId: null,
     joinTarget: null,
     serverFull: false,
+    serverGone: false,
     serverPlaying: null,
     serverMaxPlayers: null
   };
@@ -747,13 +781,18 @@ app.post("/donation", async (req, res) => {
 app.get("/donations", (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), MAX_DONATIONS);
   const includeFullServers = req.query.includeFull === "1";
-  const filtered = includeFullServers ? donationStore : donationStore.filter(d => !d.serverFull);
+  const includeGoneServers = req.query.includeGone === "1";
+  let filtered = donationStore;
+  if (!includeFullServers) filtered = filtered.filter(d => !d.serverFull);
+  if (!includeGoneServers) filtered = filtered.filter(d => !d.serverGone);
   res.json({ ok: true, count: Math.min(limit, filtered.length), donations: filtered.slice(0, limit) });
 });
 
 app.get("/donations/latest", (req, res) => {
   const includeFullServers = req.query.includeFull === "1";
-  const filtered = includeFullServers ? donationStore : donationStore.filter(d => !d.serverFull);
+  const filtered = includeFullServers
+    ? donationStore.filter(d => !d.serverGone)
+    : donationStore.filter(d => !d.serverFull && !d.serverGone);
   if (!filtered.length) return res.json({ ok: true, donation: null });
   res.json({ ok: true, donation: filtered[0] });
 });
@@ -764,15 +803,31 @@ app.get("/donation/:id", (req, res) => {
   res.json({ ok: true, donation: entry });
 });
 
-app.get("/server-capacity/:serverId", (req, res) => {
-  const cap = serverCapacityCache.get(req.params.serverId);
-  if (!cap) return res.json({ ok: false, message: "Not cached" });
+app.get("/server-capacity/:serverId", async (req, res) => {
+  const { serverId } = req.params;
+  const placeId = req.query.placeId || null;
+
+  let cap = serverCapacityCache.get(serverId);
+
+  if (!cap || cap.maxPlayers == null || cap.maxPlayers === 0) {
+    const fetched = await fetchAndCacheServerCapacity(serverId, placeId);
+    if (fetched && fetched.maxPlayers > 0) {
+      setServerCapacity(serverId, fetched.playing, fetched.maxPlayers);
+      cap = { playing: fetched.playing, maxPlayers: fetched.maxPlayers, ts: Date.now() };
+    }
+  }
+
+  if (!cap || !cap.maxPlayers) {
+    return res.json({ ok: false, message: "Server not found in any server list" });
+  }
+
   res.json({
     ok: true,
-    serverId: req.params.serverId,
+    serverId,
     playing: cap.playing,
     maxPlayers: cap.maxPlayers,
     isFull: cap.maxPlayers > 0 && cap.playing >= cap.maxPlayers,
+    isGone: cap.playing === 0 && cap.maxPlayers === 0,
     ts: cap.ts
   });
 });
@@ -806,6 +861,7 @@ app.post("/search", async (req, res) => {
   });
   res.json({ ok: true, jobId });
   setTimeout(() => jobs.delete(jobId), JOB_TTL_MS);
+  runSearch(jobId, username, placeId || DEFAULT_PLACE_ID, workers);
 });
 
 app.get("/result/:jobId", (req, res) => {
@@ -832,7 +888,15 @@ app.post("/presence-check", async (req, res) => {
   res.json({ abort: false });
 });
 
+app.post("/validate-server", async (req, res) => {
+  const { serverId, placeId } = req.body;
+  if (!serverId) return res.status(400).json({ ok: false, message: "Missing serverId" });
+  const validation = await validateServerStillAlive(serverId, placeId || null);
+  res.json({ ok: true, ...validation });
+});
+
 const server = app.listen(PORT, () => {
+  console.log(`[server] Running on port ${PORT}`);
   startLiveBroadcast();
 });
 
@@ -853,20 +917,6 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
-  if (path === "/livechannel") {
-    const authkey = url.searchParams.get("authkey");
-    if (!authkey || !authKeys.has(authkey)) { ws.close(1008, "Unauthorized"); return; }
-    const auth = authKeys.get(authkey);
-    auth.ts = Date.now();
-    const id = randomUUID();
-    liveSubscribers.set(id, ws);
-    const data = buildLiveChannelData();
-    if (Object.keys(data).length) ws.send(JSON.stringify(data));
-    ws.on("close", () => liveSubscribers.delete(id));
-    ws.on("error", () => liveSubscribers.delete(id));
-    return;
-  }
-
   if (path === "/donations/live") {
     const id = randomUUID();
     donationSubscribers.set(id, ws);
@@ -877,65 +927,8 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
-  if (path === "/api/subscriptionstatus") {
-    ws.on("message", (raw) => {
-      try {
-        const msg = JSON.parse(raw);
-        if (msg.DiscordID) {
-          const authkey = randomUUID();
-          const expiry = Math.floor(Date.now() / 1000) + 86400;
-          authKeys.set(authkey, { discord: msg.DiscordID, instances: msg.Instances || 1, ts: Date.now(), expiry });
-          subscriptionSockets.set(msg.DiscordID, ws);
-          ws.send(JSON.stringify({ expiry, ws_key: authkey, ip: req.socket.remoteAddress, sharing: false }));
-          setTimeout(() => {
-            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ expiry: Math.floor(Date.now() / 1000) + 86400 }));
-          }, 30000);
-        }
-      } catch {}
-    });
-    ws.on("close", () => {
-      for (const [discord, sock] of subscriptionSockets.entries()) {
-        if (sock === ws) subscriptionSockets.delete(discord);
-      }
-    });
-    return;
-  }
-
-  if (path === "/sniper") {
-    const authkey = url.searchParams.get("authkey");
-    if (!authkey || !authKeys.has(authkey)) { ws.close(1008, "Unauthorized"); return; }
-    const auth = authKeys.get(authkey);
-    auth.ts = Date.now();
-
-    const username = url.searchParams.get("username");
-    const placeId = url.searchParams.get("placeId") || DEFAULT_PLACE_ID;
-    const instanceCount = Math.min(Math.max(parseInt(url.searchParams.get("instances") || "1"), 1), MAX_WORKERS);
-
-    ws.send(JSON.stringify({ status: "connected" }));
-
-    ws.once("message", async (raw) => {
-      let payload;
-      try { payload = JSON.parse(raw); } catch { ws.close(); return; }
-      const targetUsername = payload.username || username;
-      const targetPlaceId = payload.placeId || placeId;
-      const targetInstances = Math.min(Math.max(parseInt(payload.instances || instanceCount), 1), MAX_WORKERS);
-      if (!targetUsername) { ws.send(JSON.stringify({ status: "error", msg: "Missing username" })); ws.close(); return; }
-      await runSearchWS(ws, targetUsername, targetPlaceId, targetInstances);
-      if (ws.readyState === WebSocket.OPEN) ws.close();
-    });
-
-    return;
-  }
-
   ws.close();
 });
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, data] of authKeys.entries()) {
-    if (now - data.ts > AUTH_KEY_TTL_MS) authKeys.delete(key);
-  }
-}, 5000);
 
 setInterval(() => {
   const liveChannelData = buildLiveChannelData();
