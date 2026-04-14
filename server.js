@@ -2,6 +2,7 @@ const express = require("express");
 const fetch = require("node-fetch");
 const { randomUUID } = require("crypto");
 const WebSocket = require("ws");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(express.json());
@@ -29,6 +30,72 @@ const PRESENCE_CACHE_TTL_MS = 15 * 1000;
 const ENRICHMENT_RETRIES = 5;
 const ENRICHMENT_RETRY_BASE_DELAY = 1200;
 const AUTH_KEY_TTL_MS = 30 * 1000;
+
+// ── Supabase ──────────────────────────────────────────────────────────────────
+const supabase = createClient(
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_KEY || ""
+);
+
+// Check if a player has ever joined (replaces Roblox joinedPlayersStore)
+async function hasPlayerJoined(username) {
+  try {
+    const { data, error } = await supabase
+      .rpc("has_player_joined", { p_username: username.toLowerCase() });
+    if (error) { console.error("[supabase] hasPlayerJoined error:", error.message); return false; }
+    return data === true;
+  } catch (e) {
+    console.error("[supabase] hasPlayerJoined exception:", e.message);
+    return false;
+  }
+}
+
+// Mark a player as joined (call this when a player enters the game)
+async function markPlayerJoined(username, userId) {
+  try {
+    const { error } = await supabase
+      .rpc("upsert_joined_player", {
+        p_username: username.toLowerCase(),
+        p_user_id: parseInt(userId) || 0
+      });
+    if (error) console.error("[supabase] markPlayerJoined error:", error.message);
+  } catch (e) {
+    console.error("[supabase] markPlayerJoined exception:", e.message);
+  }
+}
+
+// Increment raise amount for a user
+async function incrementRaise(userId, username, amount) {
+  try {
+    const { error } = await supabase
+      .rpc("increment_raise", {
+        p_user_id: parseInt(userId),
+        p_username: username,
+        p_amount: Math.floor(amount)
+      });
+    if (error) console.error("[supabase] incrementRaise error:", error.message);
+    else console.log(`[supabase] raise +${amount} for ${username} (${userId})`);
+  } catch (e) {
+    console.error("[supabase] incrementRaise exception:", e.message);
+  }
+}
+
+// Get top raisers (for leaderboard use if needed)
+async function getTopRaisers(limit = 10) {
+  try {
+    const { data, error } = await supabase
+      .from("top_raisers")
+      .select("user_id, username, raise_amount")
+      .order("raise_amount", { ascending: false })
+      .limit(limit);
+    if (error) { console.error("[supabase] getTopRaisers error:", error.message); return []; }
+    return data || [];
+  } catch (e) {
+    console.error("[supabase] getTopRaisers exception:", e.message);
+    return [];
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 const jobs = new Map();
 const liveSubscribers = new Map();
@@ -78,21 +145,21 @@ function updateDonationWithServer(entry, gameId, placeId, targetUsername) {
   entry.serverId = gameId;
   entry.placeId = placeId;
   entry.joinTarget = targetUsername;
-  
+
   const cap = serverCapacityCache.get(gameId);
   if (cap) {
     entry.serverPlaying = cap.playing;
     entry.serverMaxPlayers = cap.maxPlayers;
     entry.serverFull = cap.maxPlayers > 0 && cap.playing >= cap.maxPlayers;
   }
-  
+
   console.log(`[donation] serverId:${gameId} joinTarget:${targetUsername} for ${entry.id}`);
-  
+
   const updatedPayload = JSON.stringify({ type: "donation_update", donation: entry });
   for (const ws of donationSubscribers.values()) {
     if (ws.readyState === WebSocket.OPEN) ws.send(updatedPayload);
   }
-  
+
   setTimeout(() => {
     entry.serverId = null;
     entry.placeId = null;
@@ -171,13 +238,13 @@ async function checkPresenceForJoinFull(username) {
   try {
     const { userId } = await resolveUser(username);
     if (!userId || !ROBLOSECURITY) return null;
-    
+
     const cacheKey = `presence:${userId}`;
     const cached = presenceCache.get(cacheKey);
     if (cached && (Date.now() - cached.ts) < PRESENCE_CACHE_TTL_MS) {
       return cached.data;
     }
-    
+
     const res = await apiFetch("https://presence.roblox.com/v1/presence/users", {
       method: "POST",
       body: JSON.stringify({ userIds: [Number(userId)] })
@@ -198,7 +265,7 @@ async function checkPresenceForJoinFull(username) {
 
 async function refreshServerCapacity(serverId) {
   try {
-    const results = await Promise.allSettled(ALL_PLACE_IDS.map(async (pid) => {
+    await Promise.allSettled(ALL_PLACE_IDS.map(async (pid) => {
       const url = new URL(`https://games.roblox.com/v1/games/${pid}/servers/Public`);
       url.searchParams.set("sortOrder", "Asc");
       url.searchParams.set("limit", "100");
@@ -558,6 +625,35 @@ async function processPendingEnrichments() {
 
 setInterval(processPendingEnrichments, 2000);
 
+// ── New endpoints ─────────────────────────────────────────────────────────────
+
+// Called by Roblox server when a player joins the game
+app.post("/player-joined", async (req, res) => {
+  const { secret, username, userId } = req.body;
+  if (secret !== DONATION_SECRET) return res.status(403).json({ ok: false });
+  if (!username || !userId) return res.status(400).json({ ok: false, message: "Missing fields" });
+  await markPlayerJoined(String(username), String(userId));
+  res.json({ ok: true });
+});
+
+// Check if player has joined (for Roblox trackRaise calls)
+app.post("/has-joined", async (req, res) => {
+  const { secret, username } = req.body;
+  if (secret !== DONATION_SECRET) return res.status(403).json({ ok: false });
+  if (!username) return res.status(400).json({ ok: false });
+  const joined = await hasPlayerJoined(String(username));
+  res.json({ ok: true, joined });
+});
+
+// Top raisers leaderboard endpoint
+app.get("/top-raisers", async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || "10", 10), 100);
+  const raisers = await getTopRaisers(limit);
+  res.json({ ok: true, raisers });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size, donations: donationStore.length }));
 
 app.get("/api/livechannelstatus", (req, res) => {
@@ -571,22 +667,38 @@ app.post("/donation", async (req, res) => {
   if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
   const amount = parseInt(String(robux).replace(/,/g, ""), 10);
   if (isNaN(amount) || amount < 1000) return res.status(400).json({ ok: false, message: "Amount must be 1000 or above" });
-  
+
   const entry = { donor: String(donor), receiver: String(receiver), robux: amount, id: randomUUID(), ts: Date.now(), serverId: null, placeId: null, joinTarget: null, serverFull: false, serverPlaying: null, serverMaxPlayers: null };
   addDonation(entry);
   res.json({ ok: true });
-  
+
+  // Resolve userIds for donor/receiver for the raise tracker
+  Promise.allSettled([resolveUser(donor), resolveUser(receiver)]).then(([donorRes, receiverRes]) => {
+    if (donorRes.status === "fulfilled" && donorRes.value.userId) {
+      entry.donorId = donorRes.value.userId;
+    }
+    if (receiverRes.status === "fulfilled" && receiverRes.value.userId) {
+      entry.receiverId = receiverRes.value.userId;
+      // Track raise in Supabase (60% of robux goes to raise score, matching original logic)
+      hasPlayerJoined(receiver).then(joined => {
+        if (joined && entry.receiverId) {
+          incrementRaise(entry.receiverId, receiver, Math.floor(amount * 0.6));
+        }
+      });
+    }
+  });
+
   if (ROBLOSECURITY) {
     const donorCheck = checkPresenceForJoinFull(donor);
     const receiverCheck = checkPresenceForJoinFull(receiver);
     const results = await Promise.allSettled([donorCheck, receiverCheck]);
-    
-    const donorResult = results[0].status === 'fulfilled' ? results[0].value : null;
-    const receiverResult = results[1].status === 'fulfilled' ? results[1].value : null;
-    
+
+    const donorResult = results[0].status === "fulfilled" ? results[0].value : null;
+    const receiverResult = results[1].status === "fulfilled" ? results[1].value : null;
+
     const found = donorResult || receiverResult;
     const target = donorResult ? donor : receiverResult ? receiver : null;
-    
+
     if (found && target) {
       updateDonationWithServer(entry, found.gameId, found.placeId, target);
     } else {
