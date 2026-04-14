@@ -25,10 +25,10 @@ const DONATION_SECRET = process.env.DONATION_SECRET || "phonktobiboy!";
 const MAX_DONATIONS = 200;
 const DONATION_TTL_MS = 5 * 60 * 1000;
 const SERVER_ID_TTL_MS = 30 * 1000;
-const SERVER_CAPACITY_TTL_MS = 60 * 1000;
-const PRESENCE_CACHE_TTL_MS = 15 * 1000;
-const ENRICHMENT_RETRIES = 5;
-const ENRICHMENT_RETRY_BASE_DELAY = 1200;
+const SERVER_CAPACITY_TTL_MS = 90 * 1000;
+const PRESENCE_CACHE_TTL_MS = 10 * 1000;
+const ENRICHMENT_RETRIES = 8;
+const ENRICHMENT_RETRY_BASE_DELAY = 800;
 const AUTH_KEY_TTL_MS = 30 * 1000;
 
 const supabase = createClient(
@@ -115,6 +115,30 @@ function isServerFull(serverId) {
   return cap.playing >= cap.maxPlayers;
 }
 
+async function fetchAndCacheServerCapacity(serverId, placeId) {
+  try {
+    const targetPlaceIds = placeId ? [String(placeId)] : ALL_PLACE_IDS;
+    for (const pid of targetPlaceIds) {
+      const url = new URL(`https://games.roblox.com/v1/games/${pid}/servers/Public`);
+      url.searchParams.set("sortOrder", "Asc");
+      url.searchParams.set("limit", "100");
+      const res = await apiFetch(url.toString());
+      if (!res.ok) continue;
+      const data = await res.json();
+      const servers = data.data || [];
+      for (const s of servers) {
+        if (s.id && s.maxPlayers != null) {
+          setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+        }
+        if (s.id === serverId) {
+          return { playing: s.playing || 0, maxPlayers: s.maxPlayers };
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
 function addDonation(entry) {
   console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
   donationStore.unshift(entry);
@@ -133,20 +157,33 @@ function addDonation(entry) {
   }, DONATION_TTL_MS);
 }
 
-function updateDonationWithServer(entry, gameId, placeId, targetUsername) {
+async function updateDonationWithServer(entry, gameId, placeId, targetUsername) {
   entry.serverId = gameId;
   entry.placeId = placeId;
   entry.joinTarget = targetUsername;
 
-  const cap = serverCapacityCache.get(gameId);
-  if (cap) {
+  let cap = serverCapacityCache.get(gameId);
+
+  if (!cap || cap.maxPlayers == null || cap.maxPlayers === 0) {
+    const fetched = await fetchAndCacheServerCapacity(gameId, placeId);
+    if (fetched) {
+      setServerCapacity(gameId, fetched.playing, fetched.maxPlayers);
+      cap = { playing: fetched.playing, maxPlayers: fetched.maxPlayers };
+    }
+  }
+
+  if (cap && cap.maxPlayers != null) {
     entry.serverPlaying = cap.playing;
     entry.serverMaxPlayers = cap.maxPlayers;
     entry.serverFull = cap.maxPlayers > 0 && cap.playing >= cap.maxPlayers;
+  } else {
+    entry.serverPlaying = null;
+    entry.serverMaxPlayers = null;
+    entry.serverFull = false;
   }
 
-const playersStr = cap ? `${cap.playing}/${cap.maxPlayers}` : "?/?";
-console.log(`[donation] serverId:${gameId} | joinTarget:${targetUsername} | playing:${playersStr} | id:${entry.id}`);
+  const playersStr = cap ? `${cap.playing}/${cap.maxPlayers}` : "?/?";
+  console.log(`[donation] serverId:${gameId} | joinTarget:${targetUsername} | playing:${playersStr} | id:${entry.id}`);
 
   const updatedPayload = JSON.stringify({ type: "donation_update", donation: entry });
   for (const ws of donationSubscribers.values()) {
@@ -433,7 +470,14 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
       return;
     }
     if (presence.inGame && presence.gameId && presence.inThisGame) {
-      const cap = serverCapacityCache.get(presence.gameId);
+      let cap = serverCapacityCache.get(presence.gameId);
+      if (!cap || cap.maxPlayers == null || cap.maxPlayers === 0) {
+        const fetched = await fetchAndCacheServerCapacity(presence.gameId, presence.placeId || placeId);
+        if (fetched) {
+          setServerCapacity(presence.gameId, fetched.playing, fetched.maxPlayers);
+          cap = { playing: fetched.playing, maxPlayers: fetched.maxPlayers };
+        }
+      }
       const foundPlaceId = presence.placeId || String(placeId);
       send({
         status: "done",
@@ -465,6 +509,13 @@ async function runSearchWS(ws, username, placeId, instanceCount) {
     if (result) {
       if (result.playing != null && result.maxPlayers != null) {
         setServerCapacity(result.serverId, result.playing, result.maxPlayers);
+      } else {
+        const fetched = await fetchAndCacheServerCapacity(result.serverId, result.placeId || placeId);
+        if (fetched) {
+          setServerCapacity(result.serverId, fetched.playing, fetched.maxPlayers);
+          result.playing = fetched.playing;
+          result.maxPlayers = fetched.maxPlayers;
+        }
       }
       send({
         status: "done",
@@ -582,16 +633,20 @@ async function enrichDonationWithRetries(entry, targetUsername) {
   try {
     for (let attempt = 0; attempt < ENRICHMENT_RETRIES; attempt++) {
       if (!pendingEnrichment.has(entry.id)) return;
+
       const found = await checkPresenceForJoinFull(targetUsername);
       if (found) {
-        updateDonationWithServer(entry, found.gameId, found.placeId, targetUsername);
+        await updateDonationWithServer(entry, found.gameId, found.placeId, targetUsername);
         pendingEnrichment.delete(entry.id);
         return;
       }
+
       if (attempt < ENRICHMENT_RETRIES - 1) {
-        await sleep(ENRICHMENT_RETRY_BASE_DELAY * Math.pow(2, attempt));
+        const delay = Math.min(ENRICHMENT_RETRY_BASE_DELAY * Math.pow(1.6, attempt), 15000);
+        await sleep(delay);
       }
     }
+
     console.log(`[donation] enrichment failed for ${entry.id} after ${ENRICHMENT_RETRIES} attempts`);
     pendingEnrichment.delete(entry.id);
   } finally {
@@ -682,7 +737,7 @@ app.post("/donation", async (req, res) => {
     const target = donorResult ? donor : receiverResult ? receiver : null;
 
     if (found && target) {
-      updateDonationWithServer(entry, found.gameId, found.placeId, target);
+      await updateDonationWithServer(entry, found.gameId, found.placeId, target);
     } else {
       pendingEnrichment.set(entry.id, { entry, target: donorResult ? donor : receiver, addedAt: Date.now() });
     }
@@ -847,6 +902,11 @@ wss.on("connection", (ws, req) => {
   }
 
   if (path === "/sniper") {
+    const authkey = url.searchParams.get("authkey");
+    if (!authkey || !authKeys.has(authkey)) { ws.close(1008, "Unauthorized"); return; }
+    const auth = authKeys.get(authkey);
+    auth.ts = Date.now();
+
     const username = url.searchParams.get("username");
     const placeId = url.searchParams.get("placeId") || DEFAULT_PLACE_ID;
     const instanceCount = Math.min(Math.max(parseInt(url.searchParams.get("instances") || "1"), 1), MAX_WORKERS);
