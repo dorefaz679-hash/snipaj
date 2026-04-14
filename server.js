@@ -384,14 +384,14 @@ async function fetchServersPage(placeId, sortOrder, limit, cursor = null) {
   const res = await apiFetch(url.toString());
   if (!res.ok) return { servers: [], nextCursor: null };
   const data = await res.json();
-  const servers = (data.data || [])
-    .filter(s => s.playerTokens?.length && (!s.maxPlayers || (s.playing / s.maxPlayers) >= MIN_CAPACITY_RATIO))
-    .map(s => ({ ...s, _placeId: String(placeId) }));
-  for (const s of servers) {
+  for (const s of data.data || []) {
     if (s.id && s.maxPlayers != null && s.maxPlayers > 0) {
       setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
     }
   }
+  const servers = (data.data || [])
+    .filter(s => s.playerTokens?.length && (!s.maxPlayers || (s.playing / s.maxPlayers) >= MIN_CAPACITY_RATIO))
+    .map(s => ({ ...s, _placeId: String(placeId) }));
   return { servers, nextCursor: data.nextPageCursor || null };
 }
 
