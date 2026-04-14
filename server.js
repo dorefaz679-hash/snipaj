@@ -122,12 +122,12 @@ async function fetchAndCacheServerCapacity(serverId, placeId) {
     return { playing: existing.playing, maxPlayers: existing.maxPlayers };
   }
 
-  const targetPlaceIds = placeId ? [String(placeId)] : ALL_PLACE_IDS;
+  const targetPlaceIds = placeId ? [String(placeId), ...ALL_PLACE_IDS.filter(p => p !== String(placeId))] : ALL_PLACE_IDS;
 
   for (const pid of targetPlaceIds) {
     let cursor = null;
     let pages = 0;
-    while (pages < 6) {
+    while (pages < 15) {
       try {
         const url = new URL(`https://games.roblox.com/v1/games/${pid}/servers/Public`);
         url.searchParams.set("sortOrder", "Asc");
@@ -155,13 +155,32 @@ async function fetchAndCacheServerCapacity(serverId, placeId) {
     }
   }
 
+  try {
+    const res = await apiFetch(`https://games.roblox.com/v1/games/multiget-place-details?placeIds=${DEFAULT_PLACE_ID}`);
+    if (res.ok) {
+      const data = await res.json();
+      const place = Array.isArray(data) ? data[0] : null;
+      if (place?.maxPlayers) {
+        const cap = { playing: 0, maxPlayers: place.maxPlayers };
+        setServerCapacity(serverId, cap.playing, cap.maxPlayers);
+        return cap;
+      }
+    }
+  } catch {}
+
   return null;
 }
 
 async function validateServerStillAlive(serverId, placeId) {
   if (!serverId) return { alive: false, reason: "no_id" };
+  
+  const cached = serverCapacityCache.get(serverId);
+  if (cached && cached.maxPlayers > 0 && (Date.now() - cached.ts) < 15000) {
+    return { alive: true, playing: cached.playing, maxPlayers: cached.maxPlayers };
+  }
+
   const result = await fetchAndCacheServerCapacity(serverId, placeId);
-  if (!result) return { alive: false, reason: "not_found" };
+  if (!result) return { alive: true, reason: "not_in_list", playing: null, maxPlayers: null };
   if (result.playing === 0 && result.maxPlayers === 0) return { alive: false, reason: "gone" };
   return { alive: true, playing: result.playing, maxPlayers: result.maxPlayers };
 }
