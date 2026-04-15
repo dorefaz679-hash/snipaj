@@ -33,6 +33,7 @@ const ENRICHMENT_RETRY_BASE_DELAY = 600;
 const PRECACHE_REBUILD_INTERVAL_MS = 30 * 1000;
 const PRECACHE_BATCH_CONCURRENCY = 6;
 const PRECACHE_THUMBNAIL_SIZES = ["48x48", "720x720"];
+const PRECACHE_STALE_TTL_MS = PRECACHE_REBUILD_INTERVAL_MS * 3;
 
 const supabase = createClient(
   process.env.SUPABASE_URL || "",
@@ -113,6 +114,8 @@ class PreCache {
     this.lastBuilt = 0;
     this.totalTokens = 0;
     this.totalServers = 0;
+    this.hits = 0;
+    this.misses = 0;
   }
 
   get(thumbnailUrl) {
@@ -130,7 +133,6 @@ class PreCache {
 
     const newThumbnailIndex = new Map();
     const newServerIndex = new Map();
-    const allServers = [];
 
     try {
       await Promise.allSettled(ALL_PLACE_IDS.map(async (pid) => {
@@ -146,7 +148,7 @@ class PreCache {
             const res = await apiFetch(url.toString());
             if (!res.ok) break;
             const data = await res.json();
-            const servers = data.data || [];
+            const servers = (data.data || []).sort((a, b) => (b.playing || 0) - (a.playing || 0));
 
             for (const s of servers) {
               if (s.id && s.maxPlayers != null && s.maxPlayers > 0) {
@@ -159,7 +161,6 @@ class PreCache {
                     placeId: String(pid),
                     ts: Date.now()
                   });
-                  allServers.push({ ...s, _placeId: String(pid) });
                 }
               }
             }
@@ -171,13 +172,13 @@ class PreCache {
         }
       }));
 
-      this.totalServers = newServerIndex.size;
+      const sortedServers = Array.from(newServerIndex.entries())
+        .sort((a, b) => (b[1].playing || 0) - (a[1].playing || 0));
 
       const batchSize = PRECACHE_BATCH_CONCURRENCY;
-      const serverList = Array.from(newServerIndex.entries());
 
-      for (let i = 0; i < serverList.length; i += batchSize) {
-        const chunk = serverList.slice(i, i + batchSize);
+      for (let i = 0; i < sortedServers.length; i += batchSize) {
+        const chunk = sortedServers.slice(i, i + batchSize);
         await Promise.allSettled(chunk.map(async ([serverId, info]) => {
           const tokens = info.tokens.slice(0, 100);
           if (!tokens.length) return;
@@ -219,11 +220,29 @@ class PreCache {
         }));
       }
 
-      this.thumbnailIndex = newThumbnailIndex;
-      this.serverIndex = newServerIndex;
-      this.totalTokens = newThumbnailIndex.size;
+      for (const [key, val] of newThumbnailIndex) {
+        this.thumbnailIndex.set(key, val);
+      }
+      for (const [key, val] of newServerIndex) {
+        this.serverIndex.set(key, val);
+      }
+
+      const now = Date.now();
+      for (const [key, val] of this.thumbnailIndex) {
+        if (now - val.ts > PRECACHE_STALE_TTL_MS) {
+          this.thumbnailIndex.delete(key);
+        }
+      }
+      for (const [key, val] of this.serverIndex) {
+        if (now - val.ts > PRECACHE_STALE_TTL_MS) {
+          this.serverIndex.delete(key);
+        }
+      }
+
+      this.totalServers = this.serverIndex.size;
+      this.totalTokens = this.thumbnailIndex.size;
       this.lastBuilt = Date.now();
-      console.log(`[precache] built in ${Date.now() - start}ms | servers:${this.totalServers} | thumbnails:${this.totalTokens}`);
+      console.log(`[precache] built in ${Date.now() - start}ms | servers:${this.totalServers} | thumbnails:${this.totalTokens} | hits:${this.hits} misses:${this.misses}`);
     } catch (e) {
       console.error("[precache] build error:", e.message);
     } finally {
@@ -232,8 +251,11 @@ class PreCache {
   }
 
   startAutoRebuild() {
-    this.build();
-    setInterval(() => this.build(), PRECACHE_REBUILD_INTERVAL_MS);
+    const loop = async () => {
+      await this.build();
+      setTimeout(loop, PRECACHE_REBUILD_INTERVAL_MS);
+    };
+    loop();
   }
 }
 
@@ -489,6 +511,7 @@ async function checkPresenceForJoinFull(username) {
 async function preCacheLookup(thumbnailUrls, job) {
   const cacheAge = preCache.getAge();
   if (cacheAge > PRECACHE_REBUILD_INTERVAL_MS * 3) {
+    preCache.misses++;
     return null;
   }
 
@@ -496,6 +519,7 @@ async function preCacheLookup(thumbnailUrls, job) {
     if (!url) continue;
     const hit = preCache.get(url);
     if (hit) {
+      preCache.hits++;
       return {
         serverId: hit.serverId,
         placeId: hit.placeId,
@@ -506,35 +530,57 @@ async function preCacheLookup(thumbnailUrls, job) {
     }
   }
 
+  preCache.misses++;
   return null;
 }
 
-async function batchMatchServer(server, targetUserId, thumbnailUrls) {
+async function batchMatchServer(server, targetUserId, thumbnailUrls, seenTokens) {
   if (!server.playerTokens?.length) return null;
   if (server.maxPlayers != null && server.maxPlayers > 0) {
     setServerCapacity(server.id, server.playing || 0, server.maxPlayers);
   }
 
-  const tokens = server.playerTokens.slice(0, 100);
+  const tokens = server.playerTokens
+    .filter(t => !seenTokens.has(t))
+    .slice(0, 100);
+
+  if (!tokens.length) return null;
+
+  tokens.forEach(t => seenTokens.add(t));
+
+  const batchRequests48 = tokens.map((token, idx) => ({
+    requestId: `req_${idx}_${token}`,
+    token,
+    type: "AvatarHeadShot",
+    size: "48x48",
+    format: "png",
+    isCircular: false
+  }));
+
+  const batchRequests720 = tokens.map((token, idx) => ({
+    requestId: `req720_${idx}_${token}`,
+    token,
+    type: "AvatarHeadShot",
+    size: "720x720",
+    format: "png",
+    isCircular: false
+  }));
+
+  const allRequests = [...batchRequests48, ...batchRequests720];
+
   const tokenMap = new Map();
-  const batchRequests = tokens.map((token, idx) => {
-    const requestId = `req_${idx}_${token}`;
-    tokenMap.set(requestId, token);
-    return { requestId, token, type: "AvatarHeadShot", size: "48x48", format: "png", isCircular: false };
-  });
+  for (const req of allRequests) tokenMap.set(req.requestId, req.token);
 
   try {
     const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
       method: "POST",
       headers: robloxHeaders(),
-      body: JSON.stringify(batchRequests)
+      body: JSON.stringify(allRequests)
     });
     if (!res.ok) return null;
     const data = await res.json();
     for (const entry of data.data || []) {
       if (!entry?.requestId) continue;
-      const token = tokenMap.get(entry.requestId);
-      if (!token) continue;
       if (entry.imageUrl && thumbnailUrls.some(t => t && entry.imageUrl === t)) {
         return { serverId: server.id, matchType: "thumbnail", playing: server.playing, maxPlayers: server.maxPlayers, placeId: server._placeId };
       }
@@ -572,6 +618,7 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onSte
   const sortOrders = ["Asc", "Desc"];
   const limits = [100, 50];
   const maxPages = 15;
+  const seenTokens = new Set();
 
   const notifyQueue = () => {
     if (queueResolve) { const r = queueResolve; queueResolve = null; r(); }
@@ -606,7 +653,7 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onSte
         continue;
       }
       const batch = serverQueue.splice(0, batchSize);
-      const results = await Promise.allSettled(batch.map(s => batchMatchServer(s, userId, thumbnailUrls)));
+      const results = await Promise.allSettled(batch.map(s => batchMatchServer(s, userId, thumbnailUrls, seenTokens)));
       for (const res of results) {
         if (res.status === "fulfilled" && res.value !== null) {
           found.value = true;
@@ -675,6 +722,11 @@ async function runSearch(jobId, username, placeId, instanceCount) {
     }
     if (presence.type === "online") {
       updateJob({ status: "done", result: { found: false, message: `${displayName} is on website, not in-game` } });
+      return;
+    }
+
+    if (presence.inGame && !presence.inThisGame) {
+      updateJob({ status: "done", result: { found: false, message: `${displayName} is in a different game` } });
       return;
     }
 
@@ -955,7 +1007,12 @@ app.get("/", (req, res) => res.json({
   preCacheAge: Math.round(preCache.getAge() / 1000),
   preCacheThumbnails: preCache.totalTokens,
   preCacheServers: preCache.totalServers,
-  preCacheBuilding: preCache.building
+  preCacheBuilding: preCache.building,
+  preCacheHits: preCache.hits,
+  preCacheMisses: preCache.misses,
+  preCacheHitRate: preCache.hits + preCache.misses > 0
+    ? `${((preCache.hits / (preCache.hits + preCache.misses)) * 100).toFixed(1)}%`
+    : "0%"
 }));
 
 app.get("/api/livechannelstatus", (req, res) => {
@@ -970,7 +1027,12 @@ app.get("/precache-status", (req, res) => {
     lastBuilt: preCache.lastBuilt,
     ageMs: preCache.getAge(),
     thumbnails: preCache.totalTokens,
-    servers: preCache.totalServers
+    servers: preCache.totalServers,
+    hits: preCache.hits,
+    misses: preCache.misses,
+    hitRate: preCache.hits + preCache.misses > 0
+      ? `${((preCache.hits / (preCache.hits + preCache.misses)) * 100).toFixed(1)}%`
+      : "0%"
   });
 });
 
