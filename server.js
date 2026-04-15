@@ -30,6 +30,10 @@ const PRESENCE_CACHE_TTL_MS = 10 * 1000;
 const ENRICHMENT_RETRIES = 10;
 const ENRICHMENT_RETRY_BASE_DELAY = 600;
 
+const PRECACHE_REBUILD_INTERVAL_MS = 30 * 1000;
+const PRECACHE_BATCH_CONCURRENCY = 6;
+const PRECACHE_THUMBNAIL_SIZES = ["48x48", "720x720"];
+
 const supabase = createClient(
   process.env.SUPABASE_URL || "",
   process.env.SUPABASE_KEY || ""
@@ -101,6 +105,140 @@ const presenceCache = new Map();
 const pendingEnrichment = new Map();
 const enrichmentInFlight = new Set();
 
+class PreCache {
+  constructor() {
+    this.thumbnailIndex = new Map();
+    this.serverIndex = new Map();
+    this.building = false;
+    this.lastBuilt = 0;
+    this.totalTokens = 0;
+    this.totalServers = 0;
+  }
+
+  get(thumbnailUrl) {
+    return this.thumbnailIndex.get(thumbnailUrl) || null;
+  }
+
+  getAge() {
+    return this.lastBuilt ? Date.now() - this.lastBuilt : Infinity;
+  }
+
+  async build() {
+    if (this.building) return;
+    this.building = true;
+    const start = Date.now();
+
+    const newThumbnailIndex = new Map();
+    const newServerIndex = new Map();
+    const allServers = [];
+
+    try {
+      await Promise.allSettled(ALL_PLACE_IDS.map(async (pid) => {
+        let cursor = null;
+        let pages = 0;
+        while (pages < 20) {
+          try {
+            const url = new URL(`https://games.roblox.com/v1/games/${pid}/servers/Public`);
+            url.searchParams.set("sortOrder", "Asc");
+            url.searchParams.set("limit", "100");
+            if (cursor) url.searchParams.set("cursor", cursor);
+
+            const res = await apiFetch(url.toString());
+            if (!res.ok) break;
+            const data = await res.json();
+            const servers = data.data || [];
+
+            for (const s of servers) {
+              if (s.id && s.maxPlayers != null && s.maxPlayers > 0) {
+                setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
+                if (s.playerTokens?.length) {
+                  newServerIndex.set(s.id, {
+                    tokens: s.playerTokens,
+                    playing: s.playing || 0,
+                    maxPlayers: s.maxPlayers,
+                    placeId: String(pid),
+                    ts: Date.now()
+                  });
+                  allServers.push({ ...s, _placeId: String(pid) });
+                }
+              }
+            }
+
+            cursor = data.nextPageCursor || null;
+            pages++;
+            if (!cursor) break;
+          } catch { break; }
+        }
+      }));
+
+      this.totalServers = newServerIndex.size;
+
+      const batchSize = PRECACHE_BATCH_CONCURRENCY;
+      const serverList = Array.from(newServerIndex.entries());
+
+      for (let i = 0; i < serverList.length; i += batchSize) {
+        const chunk = serverList.slice(i, i + batchSize);
+        await Promise.allSettled(chunk.map(async ([serverId, info]) => {
+          const tokens = info.tokens.slice(0, 100);
+          if (!tokens.length) return;
+
+          const batchRequests = [];
+          for (const token of tokens) {
+            for (const size of PRECACHE_THUMBNAIL_SIZES) {
+              batchRequests.push({
+                requestId: `${size}:${token}`,
+                token,
+                type: "AvatarHeadShot",
+                size,
+                format: "png",
+                isCircular: false
+              });
+            }
+          }
+
+          try {
+            const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
+              method: "POST",
+              headers: robloxHeaders(),
+              body: JSON.stringify(batchRequests)
+            });
+            if (!res.ok) return;
+            const data = await res.json();
+            for (const entry of data.data || []) {
+              if (entry.imageUrl && entry.state === "Completed") {
+                newThumbnailIndex.set(entry.imageUrl, {
+                  serverId,
+                  placeId: info.placeId,
+                  playing: info.playing,
+                  maxPlayers: info.maxPlayers,
+                  ts: Date.now()
+                });
+              }
+            }
+          } catch {}
+        }));
+      }
+
+      this.thumbnailIndex = newThumbnailIndex;
+      this.serverIndex = newServerIndex;
+      this.totalTokens = newThumbnailIndex.size;
+      this.lastBuilt = Date.now();
+      console.log(`[precache] built in ${Date.now() - start}ms | servers:${this.totalServers} | thumbnails:${this.totalTokens}`);
+    } catch (e) {
+      console.error("[precache] build error:", e.message);
+    } finally {
+      this.building = false;
+    }
+  }
+
+  startAutoRebuild() {
+    this.build();
+    setInterval(() => this.build(), PRECACHE_REBUILD_INTERVAL_MS);
+  }
+}
+
+const preCache = new PreCache();
+
 function setServerCapacity(serverId, playing, maxPlayers) {
   if (serverId && maxPlayers != null && maxPlayers > 0) {
     serverCapacityCache.set(serverId, { playing: playing || 0, maxPlayers, ts: Date.now() });
@@ -120,6 +258,12 @@ async function fetchAndCacheServerCapacity(serverId, placeId) {
   const existing = serverCapacityCache.get(serverId);
   if (existing && existing.maxPlayers > 0 && (Date.now() - existing.ts) < 30000) {
     return { playing: existing.playing, maxPlayers: existing.maxPlayers };
+  }
+
+  const cached = preCache.serverIndex.get(serverId);
+  if (cached && cached.maxPlayers > 0 && (Date.now() - cached.ts) < 60000) {
+    setServerCapacity(serverId, cached.playing, cached.maxPlayers);
+    return { playing: cached.playing, maxPlayers: cached.maxPlayers };
   }
 
   const targetPlaceIds = placeId ? [String(placeId), ...ALL_PLACE_IDS.filter(p => p !== String(placeId))] : ALL_PLACE_IDS;
@@ -173,7 +317,7 @@ async function fetchAndCacheServerCapacity(serverId, placeId) {
 
 async function validateServerStillAlive(serverId, placeId) {
   if (!serverId) return { alive: false, reason: "no_id" };
-  
+
   const cached = serverCapacityCache.get(serverId);
   if (cached && cached.maxPlayers > 0 && (Date.now() - cached.ts) < 15000) {
     return { alive: true, playing: cached.playing, maxPlayers: cached.maxPlayers };
@@ -342,6 +486,29 @@ async function checkPresenceForJoinFull(username) {
   } catch { return null; }
 }
 
+async function preCacheLookup(thumbnailUrls, job) {
+  const cacheAge = preCache.getAge();
+  if (cacheAge > PRECACHE_REBUILD_INTERVAL_MS * 3) {
+    return null;
+  }
+
+  for (const url of thumbnailUrls) {
+    if (!url) continue;
+    const hit = preCache.get(url);
+    if (hit) {
+      return {
+        serverId: hit.serverId,
+        placeId: hit.placeId,
+        playing: hit.playing,
+        maxPlayers: hit.maxPlayers,
+        matchType: "precache"
+      };
+    }
+  }
+
+  return null;
+}
+
 async function batchMatchServer(server, targetUserId, thumbnailUrls) {
   if (!server.playerTokens?.length) return null;
   if (server.maxPlayers != null && server.maxPlayers > 0) {
@@ -418,7 +585,7 @@ async function deepSnipe(job, userId, thumbnailUrls, placeId, workerCount, onSte
         const { servers, nextCursor } = await fetchServersPage(targetPid, sortOrder, limit, cursor);
         seen += servers.length;
         pages++;
-        const step = `Scanning servers... (${seen} checked)`;
+        const step = `Live scanning servers... (${seen} checked)`;
         if (onStep) onStep(step);
         job.step = step;
         if (servers.length) { serverQueue.push(...servers); notifyQueue(); }
@@ -541,6 +708,49 @@ async function runSearch(jobId, username, placeId, instanceCount) {
         }
       });
       return;
+    }
+
+    if (job.cancelled) return;
+
+    const cacheAge = preCache.getAge();
+    const cacheAgeSeconds = Math.round(cacheAge / 1000);
+    updateJob({ step: `Checking pre-cache (age: ${cacheAgeSeconds}s)...` });
+
+    const preCacheResult = await preCacheLookup([thumb48, thumb720], job);
+
+    if (preCacheResult && !job.cancelled) {
+      console.log(`[precache] hit for ${username} -> server ${preCacheResult.serverId}`);
+      let cap = serverCapacityCache.get(preCacheResult.serverId);
+      if (!cap || !cap.maxPlayers) {
+        const fetched = await fetchAndCacheServerCapacity(preCacheResult.serverId, preCacheResult.placeId);
+        if (fetched && fetched.maxPlayers > 0) {
+          setServerCapacity(preCacheResult.serverId, fetched.playing, fetched.maxPlayers);
+          cap = fetched;
+        }
+      }
+      const validation = await validateServerStillAlive(preCacheResult.serverId, preCacheResult.placeId);
+      if (validation.alive) {
+        updateJob({
+          status: "done",
+          result: {
+            found: true,
+            serverId: preCacheResult.serverId,
+            placeId: preCacheResult.placeId || String(placeId),
+            userId: String(userId),
+            displayName,
+            thumbnailUrl: thumb150,
+            matchType: "precache",
+            players: cap && cap.maxPlayers > 0 ? `${cap.playing}/${cap.maxPlayers}` : "?",
+            serverPlaying: cap ? cap.playing : null,
+            serverMaxPlayers: cap ? cap.maxPlayers : null,
+            placename: "PLS DONATE 💸",
+            serverFull: cap ? isServerFull(preCacheResult.serverId) : false,
+            serverGone: false
+          }
+        });
+        return;
+      }
+      console.log(`[precache] hit for ${username} but server gone, falling back to live scan`);
     }
 
     if (job.cancelled) return;
@@ -738,11 +948,30 @@ app.get("/top-raisers", async (req, res) => {
   res.json({ ok: true, raisers });
 });
 
-app.get("/", (req, res) => res.json({ status: "ok", activeJobs: jobs.size, donations: donationStore.length }));
+app.get("/", (req, res) => res.json({
+  status: "ok",
+  activeJobs: jobs.size,
+  donations: donationStore.length,
+  preCacheAge: Math.round(preCache.getAge() / 1000),
+  preCacheThumbnails: preCache.totalTokens,
+  preCacheServers: preCache.totalServers,
+  preCacheBuilding: preCache.building
+}));
 
 app.get("/api/livechannelstatus", (req, res) => {
   const count = liveDataCache.size;
   res.json({ ok: true, count, status: count > 0 ? 200 : 204 });
+});
+
+app.get("/precache-status", (req, res) => {
+  res.json({
+    ok: true,
+    building: preCache.building,
+    lastBuilt: preCache.lastBuilt,
+    ageMs: preCache.getAge(),
+    thumbnails: preCache.totalTokens,
+    servers: preCache.totalServers
+  });
 });
 
 app.post("/donation", async (req, res) => {
@@ -917,6 +1146,7 @@ app.post("/validate-server", async (req, res) => {
 const server = app.listen(PORT, () => {
   console.log(`[server] Running on port ${PORT}`);
   startLiveBroadcast();
+  preCache.startAutoRebuild();
 });
 
 setInterval(() => { fetch(`http://localhost:${PORT}/`).catch(() => {}); }, 14 * 60 * 1000);
