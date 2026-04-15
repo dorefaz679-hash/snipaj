@@ -288,12 +288,14 @@ async function fetchAndCacheServerCapacity(serverId, placeId) {
     return { playing: cached.playing, maxPlayers: cached.maxPlayers };
   }
 
-  const targetPlaceIds = placeId ? [String(placeId), ...ALL_PLACE_IDS.filter(p => p !== String(placeId))] : ALL_PLACE_IDS;
+  const targetPlaceIds = placeId
+    ? [String(placeId), ...ALL_PLACE_IDS.filter(p => p !== String(placeId))]
+    : ALL_PLACE_IDS;
 
   for (const pid of targetPlaceIds) {
     let cursor = null;
     let pages = 0;
-    while (pages < 15) {
+    while (pages < 5) {
       try {
         const url = new URL(`https://games.roblox.com/v1/games/${pid}/servers/Public`);
         url.searchParams.set("sortOrder", "Asc");
@@ -320,19 +322,6 @@ async function fetchAndCacheServerCapacity(serverId, placeId) {
       } catch { break; }
     }
   }
-
-  try {
-    const res = await apiFetch(`https://games.roblox.com/v1/games/multiget-place-details?placeIds=${DEFAULT_PLACE_ID}`);
-    if (res.ok) {
-      const data = await res.json();
-      const place = Array.isArray(data) ? data[0] : null;
-      if (place?.maxPlayers) {
-        const cap = { playing: 0, maxPlayers: place.maxPlayers };
-        setServerCapacity(serverId, cap.playing, cap.maxPlayers);
-        return cap;
-      }
-    }
-  } catch {}
 
   return null;
 }
@@ -1117,8 +1106,21 @@ app.get("/server-capacity/:serverId", async (req, res) => {
   const { serverId } = req.params;
   const placeId = req.query.placeId || null;
 
-  let cap = serverCapacityCache.get(serverId);
+  const precached = preCache.serverIndex.get(serverId);
+  if (precached && precached.maxPlayers > 0 && (Date.now() - precached.ts) < 25000) {
+    setServerCapacity(serverId, precached.playing, precached.maxPlayers);
+    return res.json({
+      ok: true,
+      serverId,
+      playing: precached.playing,
+      maxPlayers: precached.maxPlayers,
+      isFull: precached.playing >= precached.maxPlayers,
+      isGone: false,
+      ts: precached.ts
+    });
+  }
 
+  let cap = serverCapacityCache.get(serverId);
   if (!cap || cap.maxPlayers == null || cap.maxPlayers === 0) {
     const fetched = await fetchAndCacheServerCapacity(serverId, placeId);
     if (fetched && fetched.maxPlayers > 0) {
