@@ -159,7 +159,6 @@ const presenceCache = new Map();
 const pendingEnrichment = new Map();
 const enrichmentInFlight = new Set();
 
-// NEW: fast-path server lookup by serverId -> donation
 const serverToDonation = new Map();
 
 function tokenHash(tokens) {
@@ -185,7 +184,6 @@ class PreCache {
     this.hits = 0;
     this.misses = 0;
     this.lastBuildMs = 0;
-    // NEW: presence-first index: userId -> serverId
     this.userPresenceIndex = new Map();
   }
 
@@ -477,15 +475,13 @@ async function getAccurateCapacity(serverId, placeId) {
   return cap;
 }
 
-// NEW: broadcast donation update to all WebSocket subscribers AND HTTP long-poll waiters
-const donationLongPollWaiters = new Map(); // donationId -> resolve[]
+const donationLongPollWaiters = new Map();
 
 function notifyDonationUpdate(entry) {
   const payload = JSON.stringify({ type: "donation_update", donation: entry });
   for (const ws of donationSubscribers.values()) {
     if (ws.readyState === WebSocket.OPEN) ws.send(payload);
   }
-  // resolve any long-poll waiters for this donation
   const waiters = donationLongPollWaiters.get(entry.id);
   if (waiters && waiters.length) {
     for (const resolve of waiters) resolve(entry);
@@ -630,7 +626,6 @@ async function getPresenceStatus(userId, placeId) {
   } catch { return { type: "unknown", inGame: false, inThisGame: false, gameId: null }; }
 }
 
-// NEW: batch presence check for both donor + receiver simultaneously
 async function checkPresenceForJoinFull(username) {
   try {
     const { userId } = await resolveUser(username);
@@ -658,7 +653,6 @@ async function checkPresenceForJoinFull(username) {
   } catch { return null; }
 }
 
-// NEW: resolve userIds for both users at once, then hit presence in a single API call
 async function checkPresenceBatch(donor, receiver) {
   try {
     if (!COOKIES.length) return { donor: null, receiver: null };
@@ -1216,8 +1210,6 @@ app.get("/precache-status", (req, res) => {
   });
 });
 
-// NEW: long-poll endpoint — Roblox polls this and it waits up to 25s for a server to appear
-// This gives near-instant notification without WebSocket
 app.get("/donation/:id/wait", async (req, res) => {
   const entry = donationStore.find(d => d.id === req.params.id);
   if (!entry) return res.status(404).json({ ok: false });
@@ -1243,7 +1235,7 @@ app.get("/donation/:id/wait", async (req, res) => {
 });
 
 app.post("/donation", async (req, res) => {
-  const { secret, donor, receiver, robux } = req.body;
+  const { secret, donor, receiver, robux, serverId, placeId } = req.body;
   if (secret !== DONATION_SECRET) return res.status(403).json({ ok: false, message: "Forbidden" });
   if (!donor || !receiver || !robux) return res.status(400).json({ ok: false, message: "Missing fields" });
   const amount = parseInt(String(robux).replace(/,/g, ""), 10);
@@ -1255,14 +1247,15 @@ app.post("/donation", async (req, res) => {
     robux: amount,
     id: randomUUID(),
     ts: Date.now(),
-    serverId: null,
-    placeId: null,
-    joinTarget: null,
+    serverId: serverId ? String(serverId) : null,
+    placeId: placeId ? String(placeId) : null,
+    joinTarget: receiver,
     serverFull: false,
     serverGone: false,
     serverPlaying: null,
     serverMaxPlayers: null
   };
+
   addDonation(entry);
   res.json({ ok: true, donationId: entry.id });
 
@@ -1276,12 +1269,22 @@ app.post("/donation", async (req, res) => {
     }
   });
 
+  if (entry.serverId) {
+    const cap = await getAccurateCapacity(entry.serverId, entry.placeId);
+    if (cap && cap.maxPlayers != null && cap.maxPlayers > 0) {
+      entry.serverPlaying = cap.playing;
+      entry.serverMaxPlayers = cap.maxPlayers;
+      entry.serverFull = cap.playing >= cap.maxPlayers;
+    }
+    notifyDonationUpdate(entry);
+    console.log(`[donation] instant serverId:${entry.serverId} | joinTarget:${receiver} | playing:${entry.serverPlaying}/${entry.serverMaxPlayers} | id:${entry.id}`);
+    return;
+  }
+
   if (COOKIES.length) {
-    // NEW: single batch presence call instead of two separate ones
     const batch = await checkPresenceBatch(donor, receiver);
     const found = batch.donor || batch.receiver;
     const target = batch.donor ? donor : batch.receiver ? receiver : null;
-
     if (found && target) {
       await updateDonationWithServer(entry, found.gameId, found.placeId, target);
     } else {
