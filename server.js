@@ -169,50 +169,20 @@ class PreCache {
     }
   }
 
-  async fetchPlacePagesParallel(placeId) {
-    const collected = [];
-    let cursor = null;
-    let pages = 0;
-
-    while (pages < PRECACHE_MAX_PAGES_PER_PLACE) {
-      const batchSize = Math.min(PRECACHE_PAGE_CONCURRENCY_PER_PLACE, PRECACHE_MAX_PAGES_PER_PLACE - pages);
-      if (batchSize <= 0) break;
-
-      const firstResult = await this.fetchSinglePage(placeId, cursor);
-      if (!firstResult || !firstResult.servers || firstResult.servers.length === 0) break;
-      collected.push(...firstResult.servers);
-      pages++;
-
-      if (!firstResult.nextCursor) break;
-
-      const lookaheadCursors = [firstResult.nextCursor];
-      cursor = firstResult.nextCursor;
-
-      const remaining = batchSize - 1;
-      const lookaheadPromises = [];
-      for (let i = 0; i < remaining && pages < PRECACHE_MAX_PAGES_PER_PLACE; i++) {
-        lookaheadPromises.push(this.fetchSinglePage(placeId, cursor));
-        pages++;
-      }
-
-      if (lookaheadPromises.length > 0) {
-        const results = await Promise.allSettled(lookaheadPromises);
-        let lastValidCursor = null;
-        for (const r of results) {
-          if (r.status === "fulfilled" && r.value && r.value.servers && r.value.servers.length > 0) {
-            collected.push(...r.value.servers);
-            if (r.value.nextCursor) lastValidCursor = r.value.nextCursor;
-          }
-        }
-        cursor = lastValidCursor;
-        if (!cursor) break;
-      } else {
-        break;
-      }
-    }
-
-    return collected;
+async fetchPlacePagesParallel(placeId) {
+  const collected = [];
+  let cursor = null;
+  let pages = 0;
+  while (pages < PRECACHE_MAX_PAGES_PER_PLACE) {
+    const result = await this.fetchSinglePage(placeId, cursor);
+    if (!result || !result.servers || result.servers.length === 0) break;
+    collected.push(...result.servers);
+    pages++;
+    cursor = result.nextCursor;
+    if (!cursor) break;
   }
+  return collected;
+}
 
   async build() {
     if (this.building) return;
