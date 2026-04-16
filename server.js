@@ -8,8 +8,8 @@ const { createClient } = require("@supabase/supabase-js");
 const keepAliveAgent = new https.Agent({
   keepAlive: true,
   keepAliveMsecs: 30000,
-  maxSockets: 256,
-  maxFreeSockets: 64,
+  maxSockets: 512,
+  maxFreeSockets: 128,
   timeout: 15000,
   scheduling: "fifo"
 });
@@ -29,6 +29,7 @@ if (!COOKIES.length && process.env.ROBLOSECURITY) COOKIES.push(process.env.ROBLO
 
 let cookieRoundRobin = 0;
 const cookieFailCounts = new Map();
+const cookieLastUsed = new Map();
 
 function getNextCookie() {
   for (let i = 0; i < COOKIES.length; i++) {
@@ -36,6 +37,7 @@ function getNextCookie() {
     const fails = cookieFailCounts.get(idx) || 0;
     if (fails < 5) {
       cookieRoundRobin = (idx + 1) % COOKIES.length;
+      cookieLastUsed.set(idx, Date.now());
       return { cookie: COOKIES[idx], idx };
     }
   }
@@ -78,16 +80,16 @@ const MAX_DONATIONS = 200;
 const DONATION_TTL_MS = 5 * 60 * 1000;
 const SERVER_ID_TTL_MS = 30 * 1000;
 const SERVER_CAPACITY_TTL_MS = 120 * 1000;
-const PRESENCE_CACHE_TTL_MS = 10 * 1000;
-const ENRICHMENT_RETRIES = 10;
-const ENRICHMENT_RETRY_BASE_DELAY = 600;
+const PRESENCE_CACHE_TTL_MS = 8 * 1000;
+const ENRICHMENT_RETRIES = 12;
+const ENRICHMENT_RETRY_BASE_DELAY = 400;
 
-const PRECACHE_REBUILD_INTERVAL_MS = 8 * 1000;
-const PRECACHE_THUMB_CONCURRENCY = 32;
-const PRECACHE_MAX_PAGES_PER_PLACE = 25;
+const PRECACHE_REBUILD_INTERVAL_MS = 6 * 1000;
+const PRECACHE_THUMB_CONCURRENCY = 48;
+const PRECACHE_MAX_PAGES_PER_PLACE = 30;
 const PRECACHE_TOKENS_PER_BATCH = 100;
 const PRECACHE_STALE_TTL_MS = 60 * 1000;
-const PRECACHE_TOKEN_HASH_TTL_MS = 45 * 1000;
+const PRECACHE_TOKEN_HASH_TTL_MS = 40 * 1000;
 
 const supabase = createClient(
   process.env.SUPABASE_URL || "",
@@ -157,6 +159,9 @@ const presenceCache = new Map();
 const pendingEnrichment = new Map();
 const enrichmentInFlight = new Set();
 
+// NEW: fast-path server lookup by serverId -> donation
+const serverToDonation = new Map();
+
 function tokenHash(tokens) {
   if (!tokens || !tokens.length) return "";
   let h = 0;
@@ -180,6 +185,8 @@ class PreCache {
     this.hits = 0;
     this.misses = 0;
     this.lastBuildMs = 0;
+    // NEW: presence-first index: userId -> serverId
+    this.userPresenceIndex = new Map();
   }
 
   get(thumbnailUrl) {
@@ -470,6 +477,22 @@ async function getAccurateCapacity(serverId, placeId) {
   return cap;
 }
 
+// NEW: broadcast donation update to all WebSocket subscribers AND HTTP long-poll waiters
+const donationLongPollWaiters = new Map(); // donationId -> resolve[]
+
+function notifyDonationUpdate(entry) {
+  const payload = JSON.stringify({ type: "donation_update", donation: entry });
+  for (const ws of donationSubscribers.values()) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+  }
+  // resolve any long-poll waiters for this donation
+  const waiters = donationLongPollWaiters.get(entry.id);
+  if (waiters && waiters.length) {
+    for (const resolve of waiters) resolve(entry);
+    donationLongPollWaiters.delete(entry.id);
+  }
+}
+
 function addDonation(entry) {
   console.log(`[donation] ${entry.donor} -> ${entry.receiver} ${entry.robux}R$`);
   donationStore.unshift(entry);
@@ -485,6 +508,7 @@ function addDonation(entry) {
     if (idx !== -1) donationStore.splice(idx, 1);
     pendingEnrichment.delete(entry.id);
     enrichmentInFlight.delete(entry.id);
+    if (entry.serverId) serverToDonation.delete(entry.serverId);
   }, DONATION_TTL_MS);
 }
 
@@ -492,6 +516,8 @@ async function updateDonationWithServer(entry, gameId, placeId, targetUsername) 
   entry.serverId = gameId;
   entry.placeId = placeId;
   entry.joinTarget = targetUsername;
+
+  if (entry.serverId) serverToDonation.set(entry.serverId, entry);
 
   const cap = await getAccurateCapacity(gameId, placeId);
 
@@ -510,12 +536,10 @@ async function updateDonationWithServer(entry, gameId, placeId, targetUsername) 
   const playersStr = cap && cap.maxPlayers > 0 ? `${cap.playing}/${cap.maxPlayers}` : "?/?";
   console.log(`[donation] serverId:${gameId} | joinTarget:${targetUsername} | playing:${playersStr} | id:${entry.id}`);
 
-  const updatedPayload = JSON.stringify({ type: "donation_update", donation: entry });
-  for (const ws of donationSubscribers.values()) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(updatedPayload);
-  }
+  notifyDonationUpdate(entry);
 
   setTimeout(() => {
+    if (entry.serverId) serverToDonation.delete(entry.serverId);
     entry.serverId = null;
     entry.placeId = null;
     entry.joinTarget = null;
@@ -550,14 +574,14 @@ async function apiFetch(url, opts = {}, retries = 5) {
         const next = getNextCookie();
         cookie = next.cookie;
         idx = next.idx;
-        await sleep(1500 * (i + 1));
+        await sleep(1200 * (i + 1));
         continue;
       }
       markCookieSuccess(idx);
       return res;
     } catch (e) {
       if (i === retries - 1) throw e;
-      await sleep(800 * (i + 1));
+      await sleep(600 * (i + 1));
     }
   }
   throw new Error("Max retries exceeded");
@@ -606,6 +630,7 @@ async function getPresenceStatus(userId, placeId) {
   } catch { return { type: "unknown", inGame: false, inThisGame: false, gameId: null }; }
 }
 
+// NEW: batch presence check for both donor + receiver simultaneously
 async function checkPresenceForJoinFull(username) {
   try {
     const { userId } = await resolveUser(username);
@@ -631,6 +656,38 @@ async function checkPresenceForJoinFull(username) {
     presenceCache.set(cacheKey, { data: result, ts: Date.now() });
     return result;
   } catch { return null; }
+}
+
+// NEW: resolve userIds for both users at once, then hit presence in a single API call
+async function checkPresenceBatch(donor, receiver) {
+  try {
+    if (!COOKIES.length) return { donor: null, receiver: null };
+    const [dr, rr] = await Promise.allSettled([resolveUser(donor), resolveUser(receiver)]);
+    const donorId = dr.status === "fulfilled" && dr.value.userId ? Number(dr.value.userId) : null;
+    const receiverId = rr.status === "fulfilled" && rr.value.userId ? Number(rr.value.userId) : null;
+    const userIds = [donorId, receiverId].filter(Boolean);
+    if (!userIds.length) return { donor: null, receiver: null };
+
+    const res = await apiFetch("https://presence.roblox.com/v1/presence/users", {
+      method: "POST",
+      body: JSON.stringify({ userIds })
+    });
+    const data = await res.json();
+    const presences = data?.userPresences || [];
+
+    const extract = (userId) => {
+      const p = presences.find(x => x.userId === userId);
+      if (!p || p.userPresenceType !== 2) return null;
+      const userPlaceId = String(p.rootPlaceId || p.placeId || "");
+      const inThisGame = ALL_PLACE_IDS.includes(userPlaceId) || String(p.universeId) === String(DEFAULT_UNIVERSE_ID);
+      return (inThisGame && p.gameId) ? { gameId: p.gameId, placeId: userPlaceId } : null;
+    };
+
+    return {
+      donor: donorId ? extract(donorId) : null,
+      receiver: receiverId ? extract(receiverId) : null
+    };
+  } catch { return { donor: null, receiver: null }; }
 }
 
 async function preCacheLookup(thumbnailUrls, job) {
@@ -1075,7 +1132,7 @@ async function enrichDonationWithRetries(entry, targetUsername) {
       }
 
       if (attempt < ENRICHMENT_RETRIES - 1) {
-        const delay = Math.min(ENRICHMENT_RETRY_BASE_DELAY * Math.pow(1.5, attempt), 12000);
+        const delay = Math.min(ENRICHMENT_RETRY_BASE_DELAY * Math.pow(1.4, attempt), 10000);
         await sleep(delay);
       }
     }
@@ -1095,7 +1152,7 @@ async function processPendingEnrichments() {
   }
 }
 
-setInterval(processPendingEnrichments, 2000);
+setInterval(processPendingEnrichments, 1500);
 
 app.post("/player-joined", async (req, res) => {
   const { secret, username, userId } = req.body;
@@ -1159,6 +1216,32 @@ app.get("/precache-status", (req, res) => {
   });
 });
 
+// NEW: long-poll endpoint — Roblox polls this and it waits up to 25s for a server to appear
+// This gives near-instant notification without WebSocket
+app.get("/donation/:id/wait", async (req, res) => {
+  const entry = donationStore.find(d => d.id === req.params.id);
+  if (!entry) return res.status(404).json({ ok: false });
+  if (entry.serverId) return res.json({ ok: true, donation: entry, ready: true });
+
+  const timeout = Math.min(parseInt(req.query.timeout || "20000"), 25000);
+
+  const result = await Promise.race([
+    new Promise(resolve => {
+      if (!donationLongPollWaiters.has(entry.id)) donationLongPollWaiters.set(entry.id, []);
+      donationLongPollWaiters.get(entry.id).push(resolve);
+    }),
+    new Promise(resolve => setTimeout(() => resolve(null), timeout))
+  ]);
+
+  if (result) {
+    return res.json({ ok: true, donation: result, ready: true });
+  }
+
+  const fresh = donationStore.find(d => d.id === req.params.id);
+  if (fresh && fresh.serverId) return res.json({ ok: true, donation: fresh, ready: true });
+  return res.json({ ok: true, donation: entry, ready: false });
+});
+
 app.post("/donation", async (req, res) => {
   const { secret, donor, receiver, robux } = req.body;
   if (secret !== DONATION_SECRET) return res.status(403).json({ ok: false, message: "Forbidden" });
@@ -1181,7 +1264,7 @@ app.post("/donation", async (req, res) => {
     serverMaxPlayers: null
   };
   addDonation(entry);
-  res.json({ ok: true });
+  res.json({ ok: true, donationId: entry.id });
 
   Promise.allSettled([resolveUser(donor), resolveUser(receiver)]).then(([donorRes, receiverRes]) => {
     if (donorRes.status === "fulfilled" && donorRes.value.userId) entry.donorId = donorRes.value.userId;
@@ -1194,19 +1277,15 @@ app.post("/donation", async (req, res) => {
   });
 
   if (COOKIES.length) {
-    const results = await Promise.allSettled([
-      checkPresenceForJoinFull(donor),
-      checkPresenceForJoinFull(receiver)
-    ]);
-    const donorResult = results[0].status === "fulfilled" ? results[0].value : null;
-    const receiverResult = results[1].status === "fulfilled" ? results[1].value : null;
-    const found = donorResult || receiverResult;
-    const target = donorResult ? donor : receiverResult ? receiver : null;
+    // NEW: single batch presence call instead of two separate ones
+    const batch = await checkPresenceBatch(donor, receiver);
+    const found = batch.donor || batch.receiver;
+    const target = batch.donor ? donor : batch.receiver ? receiver : null;
 
     if (found && target) {
       await updateDonationWithServer(entry, found.gameId, found.placeId, target);
     } else {
-      pendingEnrichment.set(entry.id, { entry, target: donorResult ? donor : receiver, addedAt: Date.now() });
+      pendingEnrichment.set(entry.id, { entry, target: receiver, addedAt: Date.now() });
     }
   }
 });
