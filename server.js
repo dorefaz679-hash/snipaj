@@ -18,7 +18,49 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const ROBLOSECURITY = process.env.ROBLOSECURITY || "";
+
+const COOKIES = [
+  process.env.ROBLOSECURITY_1,
+  process.env.ROBLOSECURITY_2,
+  process.env.ROBLOSECURITY_3,
+].filter(Boolean);
+
+if (!COOKIES.length && process.env.ROBLOSECURITY) COOKIES.push(process.env.ROBLOSECURITY);
+
+let cookieRoundRobin = 0;
+const cookieFailCounts = new Map();
+
+function getNextCookie() {
+  for (let i = 0; i < COOKIES.length; i++) {
+    const idx = (cookieRoundRobin + i) % COOKIES.length;
+    const fails = cookieFailCounts.get(idx) || 0;
+    if (fails < 5) {
+      cookieRoundRobin = (idx + 1) % COOKIES.length;
+      return { cookie: COOKIES[idx], idx };
+    }
+  }
+  cookieFailCounts.clear();
+  cookieRoundRobin = 0;
+  return { cookie: COOKIES[0], idx: 0 };
+}
+
+function markCookieFailed(idx) {
+  cookieFailCounts.set(idx, (cookieFailCounts.get(idx) || 0) + 1);
+  console.warn(`[cookie] cookie[${idx}] fail count: ${cookieFailCounts.get(idx)}`);
+}
+
+function markCookieSuccess(idx) {
+  if (cookieFailCounts.has(idx)) {
+    cookieFailCounts.set(idx, Math.max(0, cookieFailCounts.get(idx) - 1));
+  }
+}
+
+setInterval(() => {
+  for (const [idx, count] of cookieFailCounts.entries()) {
+    if (count > 0) cookieFailCounts.set(idx, Math.max(0, count - 1));
+  }
+}, 60 * 1000);
+
 const DEFAULT_UNIVERSE_ID = process.env.UNIVERSE_ID || "3317679266";
 const DEFAULT_PLACE_ID = process.env.PLACE_ID || "8737602449";
 const ALL_PLACE_IDS = [
@@ -42,7 +84,6 @@ const ENRICHMENT_RETRY_BASE_DELAY = 600;
 
 const PRECACHE_REBUILD_INTERVAL_MS = 8 * 1000;
 const PRECACHE_THUMB_CONCURRENCY = 32;
-const PRECACHE_PAGE_CONCURRENCY_PER_PLACE = 6;
 const PRECACHE_MAX_PAGES_PER_PLACE = 25;
 const PRECACHE_TOKENS_PER_BATCH = 100;
 const PRECACHE_STALE_TTL_MS = 60 * 1000;
@@ -55,8 +96,7 @@ const supabase = createClient(
 
 async function hasPlayerJoined(username) {
   try {
-    const { data, error } = await supabase
-      .rpc("has_player_joined", { p_username: username.toLowerCase() });
+    const { data, error } = await supabase.rpc("has_player_joined", { p_username: username.toLowerCase() });
     if (error) { console.error("[supabase] hasPlayerJoined error:", error.message); return false; }
     return data === true;
   } catch (e) {
@@ -67,11 +107,10 @@ async function hasPlayerJoined(username) {
 
 async function markPlayerJoined(username, userId) {
   try {
-    const { error } = await supabase
-      .rpc("upsert_joined_player", {
-        p_username: username.toLowerCase(),
-        p_user_id: parseInt(userId) || 0
-      });
+    const { error } = await supabase.rpc("upsert_joined_player", {
+      p_username: username.toLowerCase(),
+      p_user_id: parseInt(userId) || 0
+    });
     if (error) console.error("[supabase] markPlayerJoined error:", error.message);
   } catch (e) {
     console.error("[supabase] markPlayerJoined exception:", e.message);
@@ -80,12 +119,11 @@ async function markPlayerJoined(username, userId) {
 
 async function incrementRaise(userId, username, amount) {
   try {
-    const { error } = await supabase
-      .rpc("increment_raise", {
-        p_user_id: parseInt(userId),
-        p_username: username,
-        p_amount: Math.floor(amount)
-      });
+    const { error } = await supabase.rpc("increment_raise", {
+      p_user_id: parseInt(userId),
+      p_username: username,
+      p_amount: Math.floor(amount)
+    });
     if (error) console.error("[supabase] incrementRaise error:", error.message);
     else console.log(`[supabase] raise +${amount} for ${username} (${userId})`);
   } catch (e) {
@@ -158,7 +196,6 @@ class PreCache {
       url.searchParams.set("sortOrder", "Asc");
       url.searchParams.set("limit", "100");
       if (cursor) url.searchParams.set("cursor", cursor);
-
       const res = await apiFetch(url.toString());
       if (!res.ok) return { servers: [], nextCursor: null };
       const data = await res.json();
@@ -169,20 +206,20 @@ class PreCache {
     }
   }
 
-async fetchPlacePagesParallel(placeId) {
-  const collected = [];
-  let cursor = null;
-  let pages = 0;
-  while (pages < PRECACHE_MAX_PAGES_PER_PLACE) {
-    const result = await this.fetchSinglePage(placeId, cursor);
-    if (!result || !result.servers || result.servers.length === 0) break;
-    collected.push(...result.servers);
-    pages++;
-    cursor = result.nextCursor;
-    if (!cursor) break;
+  async fetchPlacePagesParallel(placeId) {
+    const collected = [];
+    let cursor = null;
+    let pages = 0;
+    while (pages < PRECACHE_MAX_PAGES_PER_PLACE) {
+      const result = await this.fetchSinglePage(placeId, cursor);
+      if (!result || !result.servers || result.servers.length === 0) break;
+      collected.push(...result.servers);
+      pages++;
+      cursor = result.nextCursor;
+      if (!cursor) break;
+    }
+    return collected;
   }
-  return collected;
-}
 
   async build() {
     if (this.building) return;
@@ -252,7 +289,6 @@ async fetchPlacePagesParallel(placeId) {
 
       await new Promise((resolve) => {
         if (!total) return resolve();
-
         const launchNext = () => {
           while (inFlight < PRECACHE_THUMB_CONCURRENCY && idx < total) {
             const item = serversToThumbnail[idx++];
@@ -297,13 +333,18 @@ async fetchPlacePagesParallel(placeId) {
     }));
 
     try {
+      const { cookie, idx } = getNextCookie();
       const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
         method: "POST",
-        headers: robloxHeaders(),
+        headers: robloxHeaders(cookie),
         body: JSON.stringify(batchRequests),
         agent: keepAliveAgent
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        if (res.status === 429) markCookieFailed(idx);
+        return;
+      }
+      markCookieSuccess(idx);
       const data = await res.json();
       const now = Date.now();
       let added = 0;
@@ -325,10 +366,6 @@ async fetchPlacePagesParallel(placeId) {
     } catch {}
   }
 
-  async thumbnailServer({ serverId, info, hash }) {
-    await this.thumbnailServerInto({ serverId, info, hash }, this.thumbnailIndex, this.serverTokenHash);
-  }
-
   startAutoRebuild() {
     const loop = async () => {
       try { await this.build(); } catch (e) {
@@ -347,12 +384,6 @@ function setServerCapacity(serverId, playing, maxPlayers) {
     serverCapacityCache.set(serverId, { playing: playing || 0, maxPlayers, ts: Date.now() });
     setTimeout(() => serverCapacityCache.delete(serverId), SERVER_CAPACITY_TTL_MS);
   }
-}
-
-function isServerFull(serverId) {
-  const cap = serverCapacityCache.get(serverId);
-  if (!cap || !cap.maxPlayers) return false;
-  return cap.playing >= cap.maxPlayers;
 }
 
 function getCapacityFromAllSources(serverId) {
@@ -493,26 +524,36 @@ async function updateDonationWithServer(entry, gameId, placeId, targetUsername) 
   }, SERVER_ID_TTL_MS);
 }
 
-function robloxHeaders() {
+function robloxHeaders(cookieOverride) {
+  const cookie = cookieOverride !== undefined ? cookieOverride : (COOKIES.length ? getNextCookie().cookie : null);
   return {
     "Accept": "application/json",
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    ...(ROBLOSECURITY && { "Cookie": `.ROBLOSECURITY=${ROBLOSECURITY}` })
+    ...(cookie && { "Cookie": `.ROBLOSECURITY=${cookie}` })
   };
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function apiFetch(url, opts = {}, retries = 5) {
+  let { cookie, idx } = getNextCookie();
   for (let i = 0; i < retries; i++) {
     try {
       const res = await fetch(url, {
         ...opts,
         agent: keepAliveAgent,
-        headers: { ...robloxHeaders(), ...(opts.headers || {}) }
+        headers: { ...robloxHeaders(cookie), ...(opts.headers || {}) }
       });
-      if (res.status === 429) { await sleep(3500 * (i + 1)); continue; }
+      if (res.status === 429) {
+        markCookieFailed(idx);
+        const next = getNextCookie();
+        cookie = next.cookie;
+        idx = next.idx;
+        await sleep(1500 * (i + 1));
+        continue;
+      }
+      markCookieSuccess(idx);
       return res;
     } catch (e) {
       if (i === retries - 1) throw e;
@@ -542,7 +583,7 @@ async function resolveHeadshot(userId, size = "150x150") {
 }
 
 async function getPresenceStatus(userId, placeId) {
-  if (!ROBLOSECURITY) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
+  if (!COOKIES.length) return { type: "unknown", inGame: false, inThisGame: false, gameId: null };
   try {
     const res = await apiFetch("https://presence.roblox.com/v1/presence/users", {
       method: "POST",
@@ -568,7 +609,7 @@ async function getPresenceStatus(userId, placeId) {
 async function checkPresenceForJoinFull(username) {
   try {
     const { userId } = await resolveUser(username);
-    if (!userId || !ROBLOSECURITY) return null;
+    if (!userId || !COOKIES.length) return null;
 
     const cacheKey = `presence:${userId}`;
     const cached = presenceCache.get(cacheKey);
@@ -654,13 +695,18 @@ async function batchMatchServer(server, targetUserId, thumbnailUrls, seenTokens)
   const allRequests = [...batchRequests48, ...batchRequests720];
 
   try {
+    const { cookie, idx } = getNextCookie();
     const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
       method: "POST",
-      headers: robloxHeaders(),
+      headers: robloxHeaders(cookie),
       body: JSON.stringify(allRequests),
       agent: keepAliveAgent
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      if (res.status === 429) markCookieFailed(idx);
+      return null;
+    }
+    markCookieSuccess(idx);
     const data = await res.json();
     for (const entry of data.data || []) {
       if (!entry?.requestId) continue;
@@ -954,12 +1000,15 @@ function startLiveBroadcast() {
           isCircular: false
         }));
         try {
+          const { cookie, idx } = getNextCookie();
           const res = await fetch("https://thumbnails.roblox.com/v1/batch", {
             method: "POST",
-            headers: robloxHeaders(),
+            headers: robloxHeaders(cookie),
             body: JSON.stringify(batchRequests),
             agent: keepAliveAgent
           });
+          if (res.status === 429) { markCookieFailed(idx); continue; }
+          markCookieSuccess(idx);
           const data = await res.json();
           const thumbs = {};
           for (const e of data.data || []) { if (e.token) thumbs[e.token] = e.imageUrl; }
@@ -1074,6 +1123,8 @@ app.get("/", (req, res) => res.json({
   status: "ok",
   activeJobs: jobs.size,
   donations: donationStore.length,
+  cookies: COOKIES.length,
+  cookieFailCounts: Object.fromEntries(cookieFailCounts),
   preCacheAge: Math.round(preCache.getAge() / 1000),
   preCacheThumbnails: preCache.totalTokens,
   preCacheServers: preCache.totalServers,
@@ -1142,7 +1193,7 @@ app.post("/donation", async (req, res) => {
     }
   });
 
-  if (ROBLOSECURITY) {
+  if (COOKIES.length) {
     const results = await Promise.allSettled([
       checkPresenceForJoinFull(donor),
       checkPresenceForJoinFull(receiver)
@@ -1286,7 +1337,7 @@ app.post("/validate-server", async (req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`[server] Running on port ${PORT}`);
+  console.log(`[server] Running on port ${PORT} | cookies: ${COOKIES.length}`);
   startLiveBroadcast();
   preCache.startAutoRebuild();
 });
