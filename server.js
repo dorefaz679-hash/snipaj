@@ -152,53 +152,6 @@ class PreCache {
     return this.lastBuilt ? Date.now() - this.lastBuilt : Infinity;
   }
 
-  async fetchPlacePagesParallel(placeId) {
-    const collected = [];
-    let cursor = null;
-    let pages = 0;
-
-    while (pages < PRECACHE_MAX_PAGES_PER_PLACE) {
-      const pageBatch = [];
-      pageBatch.push(this.fetchSinglePage(placeId, cursor));
-      let hasMore = true;
-      let nextCursor = cursor;
-
-      try {
-        const firstResult = await pageBatch[0];
-        if (!firstResult || !firstResult.servers) break;
-        collected.push(...firstResult.servers);
-        nextCursor = firstResult.nextCursor;
-        pages++;
-        if (!nextCursor) { hasMore = false; break; }
-        cursor = nextCursor;
-
-        const lookahead = [];
-        let speculativeCursor = nextCursor;
-        for (let i = 0; i < PRECACHE_PAGE_CONCURRENCY_PER_PLACE - 1 && speculativeCursor && pages < PRECACHE_MAX_PAGES_PER_PLACE; i++) {
-          lookahead.push(this.fetchSinglePage(placeId, speculativeCursor));
-          pages++;
-          speculativeCursor = null;
-          break;
-        }
-
-        if (lookahead.length) {
-          const results = await Promise.allSettled(lookahead);
-          for (const r of results) {
-            if (r.status === "fulfilled" && r.value && r.value.servers) {
-              collected.push(...r.value.servers);
-              if (r.value.nextCursor) cursor = r.value.nextCursor;
-              else hasMore = false;
-            }
-          }
-        }
-
-        if (!hasMore) break;
-      } catch { break; }
-    }
-
-    return collected;
-  }
-
   async fetchSinglePage(placeId, cursor) {
     try {
       const url = new URL(`https://games.roblox.com/v1/games/${placeId}/servers/Public`);
@@ -216,10 +169,59 @@ class PreCache {
     }
   }
 
+  async fetchPlacePagesParallel(placeId) {
+    const collected = [];
+    let cursor = null;
+    let pages = 0;
+
+    while (pages < PRECACHE_MAX_PAGES_PER_PLACE) {
+      const batchSize = Math.min(PRECACHE_PAGE_CONCURRENCY_PER_PLACE, PRECACHE_MAX_PAGES_PER_PLACE - pages);
+      if (batchSize <= 0) break;
+
+      const firstResult = await this.fetchSinglePage(placeId, cursor);
+      if (!firstResult || !firstResult.servers || firstResult.servers.length === 0) break;
+      collected.push(...firstResult.servers);
+      pages++;
+
+      if (!firstResult.nextCursor) break;
+
+      const lookaheadCursors = [firstResult.nextCursor];
+      cursor = firstResult.nextCursor;
+
+      const remaining = batchSize - 1;
+      const lookaheadPromises = [];
+      for (let i = 0; i < remaining && pages < PRECACHE_MAX_PAGES_PER_PLACE; i++) {
+        lookaheadPromises.push(this.fetchSinglePage(placeId, cursor));
+        pages++;
+      }
+
+      if (lookaheadPromises.length > 0) {
+        const results = await Promise.allSettled(lookaheadPromises);
+        let lastValidCursor = null;
+        for (const r of results) {
+          if (r.status === "fulfilled" && r.value && r.value.servers && r.value.servers.length > 0) {
+            collected.push(...r.value.servers);
+            if (r.value.nextCursor) lastValidCursor = r.value.nextCursor;
+          }
+        }
+        cursor = lastValidCursor;
+        if (!cursor) break;
+      } else {
+        break;
+      }
+    }
+
+    return collected;
+  }
+
   async build() {
     if (this.building) return;
     this.building = true;
     const start = Date.now();
+
+    const newServerIndex = new Map();
+    const newThumbnailIndex = new Map();
+    const newServerTokenHash = new Map();
 
     try {
       const placeResults = await Promise.allSettled(
@@ -228,17 +230,23 @@ class PreCache {
 
       const allServers = [];
       for (const r of placeResults) {
-        if (r.status === "fulfilled") allServers.push(...r.value);
+        if (r.status === "fulfilled" && Array.isArray(r.value)) {
+          allServers.push(...r.value);
+        }
       }
 
-      const newServerIds = new Set();
+      if (allServers.length === 0) {
+        console.warn("[precache] build fetched 0 servers, keeping existing index");
+        this.building = false;
+        return;
+      }
+
       const serversToThumbnail = [];
 
       for (const s of allServers) {
         if (!s.id || !s.maxPlayers || s.maxPlayers <= 0) continue;
         if (!s.playerTokens || !s.playerTokens.length) continue;
 
-        newServerIds.add(s.id);
         setServerCapacity(s.id, s.playing || 0, s.maxPlayers);
 
         const tokens = s.playerTokens.slice(0, PRECACHE_TOKENS_PER_BATCH);
@@ -252,10 +260,17 @@ class PreCache {
           placeId: s._placeId,
           ts: Date.now()
         };
-        this.serverIndex.set(s.id, info);
+        newServerIndex.set(s.id, info);
 
         if (!prev || prev.hash !== hash || (Date.now() - prev.ts) > PRECACHE_TOKEN_HASH_TTL_MS) {
           serversToThumbnail.push({ serverId: s.id, info, hash });
+        } else {
+          newServerTokenHash.set(s.id, prev);
+          for (const [url, val] of this.thumbnailIndex) {
+            if (val.serverId === s.id) {
+              newThumbnailIndex.set(url, val);
+            }
+          }
         }
       }
 
@@ -272,7 +287,7 @@ class PreCache {
           while (inFlight < PRECACHE_THUMB_CONCURRENCY && idx < total) {
             const item = serversToThumbnail[idx++];
             inFlight++;
-            this.thumbnailServer(item).finally(() => {
+            this.thumbnailServerInto(item, newThumbnailIndex, newServerTokenHash).finally(() => {
               inFlight--;
               if (idx >= total && inFlight === 0) resolve();
               else launchNext();
@@ -282,18 +297,9 @@ class PreCache {
         launchNext();
       });
 
-      const now = Date.now();
-      for (const [serverId, val] of this.serverIndex) {
-        if (!newServerIds.has(serverId) && (now - val.ts) > PRECACHE_STALE_TTL_MS) {
-          this.serverIndex.delete(serverId);
-          this.serverTokenHash.delete(serverId);
-        }
-      }
-      for (const [url, val] of this.thumbnailIndex) {
-        if (!newServerIds.has(val.serverId) && (now - val.ts) > PRECACHE_STALE_TTL_MS) {
-          this.thumbnailIndex.delete(url);
-        }
-      }
+      this.serverIndex = newServerIndex;
+      this.thumbnailIndex = newThumbnailIndex;
+      this.serverTokenHash = newServerTokenHash;
 
       this.totalServers = this.serverIndex.size;
       this.totalTokens = this.thumbnailIndex.size;
@@ -307,7 +313,7 @@ class PreCache {
     }
   }
 
-  async thumbnailServer({ serverId, info, hash }) {
+  async thumbnailServerInto({ serverId, info, hash }, thumbnailIndex, serverTokenHash) {
     const tokens = info.tokens;
     if (!tokens.length) return;
 
@@ -330,24 +336,34 @@ class PreCache {
       if (!res.ok) return;
       const data = await res.json();
       const now = Date.now();
+      let added = 0;
       for (const entry of data.data || []) {
         if (entry.imageUrl && entry.state === "Completed") {
-          this.thumbnailIndex.set(entry.imageUrl, {
+          thumbnailIndex.set(entry.imageUrl, {
             serverId,
             placeId: info.placeId,
             playing: info.playing,
             maxPlayers: info.maxPlayers,
             ts: now
           });
+          added++;
         }
       }
-      this.serverTokenHash.set(serverId, { hash, ts: now });
+      if (added > 0) {
+        serverTokenHash.set(serverId, { hash, ts: now });
+      }
     } catch {}
+  }
+
+  async thumbnailServer({ serverId, info, hash }) {
+    await this.thumbnailServerInto({ serverId, info, hash }, this.thumbnailIndex, this.serverTokenHash);
   }
 
   startAutoRebuild() {
     const loop = async () => {
-      try { await this.build(); } catch {}
+      try { await this.build(); } catch (e) {
+        console.error("[precache] startAutoRebuild caught:", e.message);
+      }
       setTimeout(loop, PRECACHE_REBUILD_INTERVAL_MS);
     };
     loop();
